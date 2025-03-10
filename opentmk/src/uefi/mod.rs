@@ -147,13 +147,6 @@ fn uefi_main() -> Status {
     // vp_context.msr_cr_pat = 0x277u64;
     vp_context.rip = fn_address;
     vp_context.rsp = stack_top;
-    
-    vp_context.rflags = vp_context.rflags & & !0x200;
-    vp_context.efer |= 0x800;  // Set NX (No-Execute) bit
-    vp_context.cr0 |= 0x80000000;  
-    vp_context.cr0 |= 0x1;  // Set PE bit
-    vp_context.cr4 |= 0x20;  // Set PAE bit
-
 
 
     slog!(serial, "VP Context: {:?}", vp_context);
