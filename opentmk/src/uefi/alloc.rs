@@ -6,6 +6,7 @@ use minimal_rt::arch::{IoAccess, Serial};
 use super::{single_threaded::SingleThreaded, slog};
 
 pub const SIZE_1MB: usize  = 1024 * 1024;
+static HEAP: [u8; 268435456] = [0u8; 4096* 1024 * 64];
 
 #[global_allocator]
 pub static ALLOCATOR: MemoryAllocator = MemoryAllocator {
@@ -60,14 +61,16 @@ impl MemoryAllocator {
 
     #[expect(unsafe_code)]
     pub unsafe fn init(&self, size: usize) -> bool {
-        let pages = ((SIZE_1MB * size) / 4096) + 1;
-        let size = pages * 4096;
-        let mem: Result<core::ptr::NonNull<u8>, uefi::Error> = boot::allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, pages);
-        if mem.is_err() {
-            return false;
-        }
-        let ptr = mem.unwrap().as_ptr();
+        // let pages = ((SIZE_1MB * size) / 4096) + 1;
+        // let size = pages * 4096;
+        // let mem: Result<core::ptr::NonNull<u8>, uefi::Error> = boot::allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, pages);
+        // if mem.is_err() {
+        //     return false;
+        // }
+        // let ptr = mem.unwrap().as_ptr();
+        let size = HEAP.len();
         unsafe {
+            let ptr = HEAP.as_ptr() as *mut u8;
             self.locked_heap.lock().init(ptr, size);
         }
         let mut flag = self.use_locked_heap.0.borrow_mut();

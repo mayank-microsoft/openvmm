@@ -7,6 +7,7 @@ use crate::uefi::single_threaded::SingleThreaded;
 use arrayvec::ArrayVec;
 use hvdef::hypercall::EnablePartitionVtlFlags;
 use hvdef::hypercall::InitialVpContextX64;
+use minimal_rt::arch::hypercall::{invoke_hypercall_vtl, invoke_hypercall_high};
 use core::arch;
 use core::cell::RefCell;
 use core::cell::UnsafeCell;
@@ -140,7 +141,7 @@ impl HvCall {
     ) -> hvdef::hypercall::HypercallOutput {
         self.init_if_needed();
 
-        let control = hvdef::hypercall::Control::new()
+        let control: hvdef::hypercall::Control = hvdef::hypercall::Control::new()
             .with_code(code.0)
             .with_rep_count(rep_count.unwrap_or_default());
 
@@ -274,19 +275,31 @@ impl HvCall {
         Ok(context)
     }
 
-    pub fn high_vtl(&mut self) -> Result<(), hvdef::HvError> {
-        let output = self.dispatch_hvcall(hvdef::HypercallCode::HvCallVtlCall, None);
-        match output.result() {
-            Ok(()) => Ok(()),
-            err => err,
+    pub fn high_vtl() {
+        let control: hvdef::hypercall::Control = hvdef::hypercall::Control::new()
+            .with_code(hvdef::HypercallCode::HvCallVtlCall.0)
+            .with_rep_count(0);
+
+        // SAFETY: Invoking hypercall per TLFS spec
+        unsafe {
+            invoke_hypercall_vtl(
+                control,
+            );
         }
     }
 
-    pub fn low_vtl(&mut self) -> Result<(), hvdef::HvError> {
-        let output = self.dispatch_hvcall(hvdef::HypercallCode::HvCallVtlReturn, None);
-        match output.result() {
-            Ok(()) => Ok(()),
-            err => err,
+    pub fn low_vtl() {
+        Self::input_page().buffer.fill(0u8);
+        let control: hvdef::hypercall::Control = hvdef::hypercall::Control::new()
+            .with_code(hvdef::HypercallCode::HvCallVtlReturn.0)
+            .with_rep_count(0);
+        Self::input_page().buffer.fill(0u8);
+        // SAFETY: Invoking hypercall per TLFS spec
+        unsafe {
+            invoke_hypercall_high(
+                control,
+                Self::input_page().address(),
+            );
         }
     }
 

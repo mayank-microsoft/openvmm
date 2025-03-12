@@ -21,6 +21,7 @@ HYPERCALL_PAGE:
 "#,
 }
 
+#[no_mangle]
 /// Invokes a standard hypercall, or a fast hypercall with at most two input
 /// words and zero output words.
 ///
@@ -47,4 +48,38 @@ pub unsafe fn invoke_hypercall(
         }
     }
     output.into()
+}
+
+#[no_mangle]
+pub unsafe fn invoke_hypercall_vtl(
+    control: hvdef::hypercall::Control,
+) {
+
+
+    // SAFETY: the caller guarantees the safety of this operation.
+    unsafe {
+        core::arch::asm! {
+            "call {hypercall_page}",
+            hypercall_page = sym HYPERCALL_PAGE,
+            inout("rcx") u64::from(control) => _,
+            in("rax") 0,
+        }
+    }
+}
+
+    #[no_mangle]
+    pub unsafe fn invoke_hypercall_high(
+        control: hvdef::hypercall::Control,
+        addr: u64,
+    ) {
+    // SAFETY: the caller guarantees the safety of this operation.
+    unsafe {
+        core::arch::asm! {
+            "call {hypercall_page}",
+            hypercall_page = sym HYPERCALL_PAGE,
+            inout("rcx") u64::from(control) => _,
+            in("rdx") addr,
+            in("rax") 0,
+        }
+    }
 }
