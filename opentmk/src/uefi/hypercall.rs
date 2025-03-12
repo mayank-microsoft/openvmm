@@ -7,7 +7,8 @@ use crate::uefi::single_threaded::SingleThreaded;
 use arrayvec::ArrayVec;
 use hvdef::hypercall::EnablePartitionVtlFlags;
 use hvdef::hypercall::InitialVpContextX64;
-use minimal_rt::arch::hypercall::{invoke_hypercall_vtl, invoke_hypercall_high};
+use minimal_rt::arch::hypercall::{invoke_hypercall_vtl};
+use zerocopy::FromZeros;
 use core::arch;
 use core::cell::RefCell;
 use core::cell::UnsafeCell;
@@ -250,6 +251,51 @@ impl HvCall {
         Ok(())
     }
 
+
+
+    /// Hypercall to apply vtl protections to the pages from address start to end
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+    pub fn apply_vtl_protections(&mut self, range: MemoryRange, vtl: Vtl) -> Result<(), hvdef::HvError> {
+        const HEADER_SIZE: usize = size_of::<hvdef::hypercall::ModifyVtlProtectionMask>();
+        const MAX_INPUT_ELEMENTS: usize = (HV_PAGE_SIZE as usize - HEADER_SIZE) / size_of::<u64>();
+
+        let header = hvdef::hypercall::ModifyVtlProtectionMask {
+            partition_id: hvdef::HV_PARTITION_ID_SELF,
+            map_flags: hvdef::HV_MAP_GPA_PERMISSIONS_NONE,
+            target_vtl: HvInputVtl::new()
+                            .with_target_vtl_value(vtl.into())
+                            .with_use_target_vtl(true),
+            reserved: [0; 3],
+        };
+
+        let mut current_page = range.start_4k_gpn();
+        while current_page < range.end_4k_gpn() {
+            let remaining_pages = range.end_4k_gpn() - current_page;
+            let count = remaining_pages.min(MAX_INPUT_ELEMENTS as u64);
+
+            header.write_to_prefix(Self::input_page().buffer.as_mut_slice());
+
+            let mut input_offset = HEADER_SIZE;
+            for i in 0..count {
+                let page_num = current_page + i;
+                page_num.write_to_prefix(&mut Self::input_page().buffer[input_offset..]);
+                input_offset += size_of::<u64>();
+            }
+
+            let output = self.dispatch_hvcall(
+                hvdef::HypercallCode::HvCallModifyVtlProtectionMask,
+                Some(count as usize),
+            );
+
+            output.result()?;
+
+            current_page += count;
+        }
+
+        Ok(())
+    }
+
+
     #[cfg(target_arch = "x86_64")]
     /// Hypercall to get the current VTL VP context
     pub fn get_current_vtl_vp_context(&mut self) -> Result<InitialVpContextX64, hvdef::HvError> {
@@ -293,13 +339,9 @@ impl HvCall {
         let control: hvdef::hypercall::Control = hvdef::hypercall::Control::new()
             .with_code(hvdef::HypercallCode::HvCallVtlReturn.0)
             .with_rep_count(0);
-        Self::input_page().buffer.fill(0u8);
         // SAFETY: Invoking hypercall per TLFS spec
         unsafe {
-            invoke_hypercall_high(
-                control,
-                Self::input_page().address(),
-            );
+            invoke_hypercall_vtl(control);
         }
     }
 

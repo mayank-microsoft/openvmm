@@ -51,34 +51,14 @@ pub unsafe fn invoke_hypercall(
 }
 
 #[no_mangle]
-pub unsafe fn invoke_hypercall_vtl(
-    control: hvdef::hypercall::Control,
-) {
-
-
+pub unsafe fn invoke_hypercall_vtl(control: hvdef::hypercall::Control) {
     // SAFETY: the caller guarantees the safety of this operation.
     unsafe {
         core::arch::asm! {
             "call {hypercall_page}",
             hypercall_page = sym HYPERCALL_PAGE,
             inout("rcx") u64::from(control) => _,
-            in("rax") 0,
-        }
-    }
-}
-
-    #[no_mangle]
-    pub unsafe fn invoke_hypercall_high(
-        control: hvdef::hypercall::Control,
-        addr: u64,
-    ) {
-    // SAFETY: the caller guarantees the safety of this operation.
-    unsafe {
-        core::arch::asm! {
-            "call {hypercall_page}",
-            hypercall_page = sym HYPERCALL_PAGE,
-            inout("rcx") u64::from(control) => _,
-            in("rdx") addr,
+            in("rdx") 0,
             in("rax") 0,
         }
     }

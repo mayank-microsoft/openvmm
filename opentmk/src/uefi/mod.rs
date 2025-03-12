@@ -10,14 +10,18 @@ mod rt;
 use crate::slog;
 use crate::uefi::alloc::{ALLOCATOR};
 use core::alloc::{GlobalAlloc, Layout};
+use core::arch::asm;
 use core::cell::RefCell;
 use core::fmt::Write;
+use core::ops::Range;
 use alloc::SIZE_1MB;
 use hvdef::hypercall::InitialVpContextX64;
 use hvdef::{HvRegisterVsmPartitionStatus, HvX64RegisterName, HvX64SegmentRegister, Vtl};
 use hypercall::{hvcall, HvCall};
+use memory_range::MemoryRange;
 use minimal_rt::arch::InstrIoAccess;
 use minimal_rt::arch::Serial;
+use minimal_rt::arch::hypercall::HYPERCALL_PAGE;
 use single_threaded::SingleThreaded;
 use uefi::allocator::Allocator;
 use uefi::{boot, guid, CStr16};
@@ -32,16 +36,31 @@ use zerocopy::FromZeros;
 
 
 static DATA_CONTAINER: SingleThreaded<RefCell<bool>> = SingleThreaded(RefCell::new(false));
+static HEAPX : [u8; 40960] = [7u8; 4096* 10];
 
 #[allow(unsafe_code)]
 #[no_mangle]
 fn vtl1_hello_world() {
-    let mut s =  DATA_CONTAINER.borrow_mut();
-    *s = true;
+    let guest_os_id = hvdef::hypercall::HvGuestOsMicrosoft::new().with_os_id(1);
+    crate::arch::hypercall::initialize(guest_os_id.into());
+
     let mut serial: Serial<InstrIoAccess> = Serial::new(InstrIoAccess {});
     slog!(serial, "Hello from VTL1!");
+    slog!(serial, "Trying to move to VTL0!");
+    let range = Range {
+        start: HEAPX.as_ptr() as u64,
+        end: HEAPX.as_ptr() as u64 + HEAPX.len() as u64,
+    };
+
+    let r= hvcall().apply_vtl_protections(MemoryRange::new(range), Vtl::Vtl0);
+    if let Ok(_) = r {
+        slog!(serial, "APPLY SUCCESS!");
+    } else {
+        slog!(serial, "APPLY FAILED!");
+        slog!(serial, "Error: {:?}", r.err());
+    }
     HvCall::low_vtl();
-    slog!(serial, "VTL1: back to VTL0!");
+    slog!(serial, "failed to move to VTL0!");
 }
 
 
@@ -172,11 +191,15 @@ fn uefi_main() -> Status {
 
       slog!(serial, "[NEW] VTL1 context: {:?}", vp_context);
 
+    slog!(serial, "HEAPX: {:?}", HEAPX[0]);
+    
     HvCall::high_vtl();
-   
+
+    slog!(serial, "HEAPX: {:?}", HEAPX[0]);
+
 
     slog!(serial, "VTL1 started!");
-    hvcall().uninitialize();
 
+    hvcall().uninitialize();
     Status::SUCCESS
 }
