@@ -1,6 +1,8 @@
 #[no_std]
 use serde_json::json;
 use alloc::string::{String, ToString};
+use crate::sync::Mutex;
+use crate::arch::serial::Serial;
 
 pub fn get_json_string(s: &String, terminate_new_line: bool) -> String {
     let out = json!({
@@ -15,15 +17,15 @@ pub fn get_json_string(s: &String, terminate_new_line: bool) -> String {
 
 #[macro_export]
 macro_rules! slog {
+
     ($serial:expr, $($arg:tt)*) => {
+        let mut serial : &mut Mutex<Serial<InstrIoAccess>> = &mut $serial;
         let message = format!($($arg)*);
         let js = slog::get_json_string(&message, true);
-        $serial.write_str(&js).expect("Failed to write log message");
+        {
+            let mut serial = serial.lock();
+            serial.get_mut().write_str(&js);
+        }
     };
 
-    ($serial:expr, $str:expr) => {
-        let serial : Serial<io::InstrIoAccess> = $serial;
-        let _str : &str = $str;
-        serial.write_str(_str);
-    };
 }

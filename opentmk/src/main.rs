@@ -1,5 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
+#![allow(warnings)]
+#![no_std]
+#![allow(unsafe_code)]
+#![feature(naked_functions)]
 
 #![doc = include_str!("../README.md")]
 // HACK: workaround for building guest_test_uefi as part of the workspace in CI.
@@ -16,4 +20,6 @@ fn main() {}
 extern crate alloc;
 
 mod uefi;
-mod arch;
+pub mod arch;
+pub mod slog;
+pub mod sync;

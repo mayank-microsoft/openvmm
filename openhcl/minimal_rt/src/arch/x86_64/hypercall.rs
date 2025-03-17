@@ -21,7 +21,6 @@ HYPERCALL_PAGE:
 "#,
 }
 
-#[no_mangle]
 /// Invokes a standard hypercall, or a fast hypercall with at most two input
 /// words and zero output words.
 ///
@@ -50,7 +49,6 @@ pub unsafe fn invoke_hypercall(
     output.into()
 }
 
-#[no_mangle]
 pub unsafe fn invoke_hypercall_vtl(control: hvdef::hypercall::Control) {
     // SAFETY: the caller guarantees the safety of this operation.
     unsafe {

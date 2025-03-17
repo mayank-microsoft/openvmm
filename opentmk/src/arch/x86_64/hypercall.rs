@@ -17,7 +17,7 @@ fn report_os_id(guest_os_id: u64) {
 
 #[expect(unsafe_code)]
 /// Writes an MSR to tell the hypervisor where the hypercall page is
-fn write_hypercall_msr(enable: bool) {
+pub fn write_hypercall_msr(enable: bool) {
     // SAFETY: Using the contract established in the Hyper-V TLFS.
     let hypercall_contents = hvdef::hypercall::MsrHypercallContents::from(unsafe {
         read_msr(hvdef::HV_X64_MSR_HYPERCALL)
@@ -25,8 +25,10 @@ fn write_hypercall_msr(enable: bool) {
 
     let hypercall_page_num = addr_of!(HYPERCALL_PAGE) as u64 / HV_PAGE_SIZE;
 
-    assert!(!enable || !hypercall_contents.enable());
-    let new_hv_contents = hypercall_contents.with_enable(enable).with_gpn(if enable {
+    if!(!enable || !hypercall_contents.enable()) {
+        return;
+    }
+    let new_hv_contents: hvdef::hypercall::MsrHypercallContents = hypercall_contents.with_enable(enable).with_gpn(if enable {
         hypercall_page_num
     } else {
         0
