@@ -21,7 +21,7 @@ use core::fmt::Write;
 use core::ops::Range;
 use core::sync::atomic::AtomicBool;
 use hvdef::hypercall::{HvInputVtl, InitialVpContextX64};
-use hvdef::{HvRegisterVsmPartitionStatus, HvX64RegisterName, Vtl};
+use hvdef::{HvRegisterValue, HvRegisterVsmPartitionStatus, HvX64RegisterName, Vtl};
 use hypercall::{HvCall};
 use memory_range::MemoryRange;
 use single_threaded::SingleThreaded;
@@ -126,7 +126,33 @@ fn set_int_handler(idt : Vec<*mut InterruptDescriptor64>, interrupt_idx: u8) {
 fn vtl1_hello_world() {
     let mut hvcall = HvCall::new();
     hvcall.initialize();
+    
     let mut serial = Mutex::new(Serial::new(InstrIoAccess {}));
+
+    let reg = hvcall.get_register(HvX64RegisterName::Sint0.into(), None);
+    if reg.is_err() {
+        slog!(serial, "Failed to get register value!");
+        slog!(serial, "Error: {:?}", reg.err());
+    }
+    let mut reg: hvdef::HvSynicSint = reg.unwrap().as_u64().into();
+    slog!(serial, "Register value: {:?}", reg);
+
+    reg.set_vector(0x25);
+    reg.set_masked(false);
+    reg.set_auto_eoi(true);
+
+    hvcall.set_register(HvX64RegisterName::Sint0.into(), HvRegisterValue::from(reg.into_bits()), None).expect("Failed to set register value");
+    call_interrupt_handler();
+
+    let reg = hvcall.get_register(HvX64RegisterName::Sint0.into(), None);
+    if reg.is_err() {
+        slog!(serial, "Failed to get register value!");
+        slog!(serial, "Error: {:?}", reg.err());
+    }
+    let mut reg: hvdef::HvSynicSint = reg.unwrap().as_u64().into();
+    slog!(serial, "[NEW]Register value: {:?}", reg);
+
+
     let layout = Layout::from_size_align(SIZE_1MB, 4096).expect("msg: failed to create layout");
     let ptr = unsafe { ALLOCATOR.alloc(layout) };
     unsafe {
@@ -135,43 +161,41 @@ fn vtl1_hello_world() {
     }
     let size = layout.size();
     slog!(serial, "Hello from VTL1!");
-    slog!(serial, "Trying to move to VTL0!");
-    hvcall.enable_vtl_protection(0, HvInputVtl::CURRENT_VTL);
-    hvcall.enable_vtl_protection(
-        0,
-        HvInputVtl::new()
-            .with_target_vtl_value(1)
-            .with_use_target_vtl(true),
-    );
+    let reg = hvcall.enable_vtl_protection(0, HvInputVtl::CURRENT_VTL).expect("Failed to enable VTL protection, vtl1");
     let range = Range {
         start: ptr as u64,
         end: ptr as u64 + size as u64,
     };
     slog!(serial, "Range: {:?}", range);
-    // let r= hvcall.apply_vtl_protections(MemoryRange::new(range), Vtl::Vtl1);
-    // if let Ok(_) = r {
-    //     slog!(serial, "APPLY SUCCESS!");
-    // } else {
-    //     slog!(serial, "APPLY FAILED!");
-    //     slog!(serial, "Error: {:?}", r.err());
-    // }
+    let r= hvcall.apply_vtl_protections(MemoryRange::new(range), Vtl::Vtl1);
+    if let Ok(_) = r {
+        slog!(serial, "APPLY SUCCESS!");
+    } else {
+        slog!(serial, "APPLY FAILED!");
+        slog!(serial, "Error: {:?}", r.err());
+    }
 
-    let vp_ctx_vtl1 = unsafe { run_fn_with_current_context(ap2_hello_world_vtl1, &mut hvcall) }
+    let vp_ctx_vtl1: InitialVpContextX64 = unsafe { run_fn_with_current_context(ap2_hello_world_vtl1, &mut hvcall) }
         .expect("Failed to run function with current context");
 
     hvcall
         .enable_vp_vtl(2, Vtl::Vtl1, Some(vp_ctx_vtl1))
         .expect("Failed to enable VTL1 on VP2");
 
-    let r = hvcall.start_virtual_processor(2, Vtl::Vtl1, Some(vp_ctx_vtl1));
-    if let Ok(_) = r {
-        slog!(serial, "VTL2 AP1 enabled successfully!");
-    } else {
-        slog!(serial, "Failed to enable VTL1!");
-        slog!(serial, "Error: {:?}", r.err());
-    }
+    // let r = hvcall.start_virtual_processor(2, Vtl::Vtl1, Some(vp_ctx_vtl1));
+    // if let Ok(_) = r {
+    //     slog!(serial, "VTL2 AP1 enabled successfully!");
+    // } else {
+    //     slog!(serial, "Failed to enable VTL1!");
+    //     slog!(serial, "Error: {:?}", r.err());
+    // }
+    slog!(serial, "Trying to move to VTL0!");
     HvCall::low_vtl();
     slog!(serial, "failed to move to VTL0!");
+    loop {
+        slog!(serial, "VTL1 loop!");
+        slog!(serial, "BUSY.....");
+    }
 }
 
 fn ap_write() {
@@ -235,7 +259,7 @@ fn ap2_hello_world_vtl1() {
         2,
         Some(
             HvInputVtl::new()
-                .with_target_vtl_value(1)
+                .with_target_vtl_value(0)
                 .with_use_target_vtl(true),
         ),
         Some(vp_ctx_vtl0),
@@ -246,6 +270,7 @@ fn ap2_hello_world_vtl1() {
         slog!(serial, "Failed to enable VTL0 for AP2!");
         slog!(serial, "Error: {:?}", r.err());
     }
+    HvCall::low_vtl();
 }
 
 fn run_on_vp() {
@@ -416,14 +441,17 @@ fn uefi_main() -> Status {
     // unsafe {
     // slog!(serial, "HEAPX: {:?}", HEAPX.borrow()[0]);
     // }
+
     unsafe {
         let m = MUTEX_1.lock();
         HvCall::high_vtl();
     }
-    // unsafe  {
-    //     let heapx = *HEAPX.borrow();
-    //     slog!(serial, "HEAPX: {:?}", *heapx);
-    // }
+    unsafe  {
+        slog!(serial, "Reached VTL0!");
+        let heapx = *HEAPX.borrow();
+        let val = *(heapx.add(10));
+        slog!(serial, "HEAPX: {:?}", val);
+    }
 
     slog!(serial, "VTL1 started!");
 

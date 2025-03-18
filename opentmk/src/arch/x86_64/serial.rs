@@ -8,7 +8,7 @@ use core::fmt;
 use core::sync::atomic::AtomicBool;
 use crate::sync::Mutex;
 
-const COM3: u16 = 0x2F8;
+const COM4: u16 = 0x2E8;
 static mut MUTEX : Mutex<()> = Mutex::new(());
 
 /// Write a byte to a port.
@@ -88,9 +88,9 @@ impl<T: IoAccess> Serial<T> {
     pub fn init(io: T) -> Self {
         // SAFETY: Writing these values to the serial device is safe.
         unsafe {
-            io.outb(COM3 + 1, 0x00); // Disable all interrupts
-            io.outb(COM3 + 2, 0xC7); // Enable FIFO, clear them, with 14-byte threshold
-            io.outb(COM3 + 4, 0x0F);
+            io.outb(COM4 + 1, 0x00); // Disable all interrupts
+            io.outb(COM4 + 2, 0xC7); // Enable FIFO, clear them, with 14-byte threshold
+            io.outb(COM4 + 4, 0x0F);
         }
 
         Self { io }
@@ -104,8 +104,8 @@ impl<T: IoAccess> Serial<T> {
     fn write_byte(&self, b: u8) {
         // SAFETY: Reading and writing text to the serial device is safe.
         unsafe {
-            while self.io.inb(COM3 + 5) & 0x20 == 0 {}
-            self.io.outb(COM3, b);
+            while self.io.inb(COM4 + 5) & 0x20 == 0 {}
+            self.io.outb(COM4, b);
         }
     }
 }

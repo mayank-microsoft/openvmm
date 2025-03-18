@@ -410,8 +410,10 @@ impl HvCall {
 
     pub fn enable_vtl_protection(&mut self, vp_index: u32, vtl: HvInputVtl) -> Result<(), hvdef::HvError> {
         let hvreg = self.get_register(hvdef::HvX64RegisterName::VsmPartitionConfig.into(), Some(vtl))?;
-        let hvreg = HvRegisterVsmPartitionConfig::from_bits(hvreg.as_u64());
-        let hvreg=  hvreg.with_enable_vtl_protection(true);
+        let mut hvreg: HvRegisterVsmPartitionConfig = HvRegisterVsmPartitionConfig::from_bits(hvreg.as_u64());
+        hvreg.set_enable_vtl_protection(true);
+        // hvreg.set_default_vtl_protection_mask(0b11);
+        // hvreg.set_intercept_enable_vtl_protection(true);
         let bits = hvreg.into_bits();
         let hvre: HvRegisterValue = hvdef::HvRegisterValue::from(bits);
         self.set_register(HvX64RegisterName::VsmPartitionConfig.into(), hvre, Some(vtl))
