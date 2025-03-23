@@ -73,4 +73,15 @@ impl MemoryAllocator {
         *flag = true;
         return true;
     }
+
+    pub fn get_page_alligned_memory(&self, size: usize) -> *mut u8 {
+        let pages = ((SIZE_1MB * size) / 4096) + 1;
+        let size = pages * 4096;
+        let mem: Result<core::ptr::NonNull<u8>, uefi::Error> = boot::allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, pages);
+        if mem.is_err() {
+            return core::ptr::null_mut();
+        }
+        let ptr = mem.unwrap().as_ptr();
+        return ptr;
+    }
 }

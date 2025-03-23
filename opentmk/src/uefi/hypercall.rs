@@ -7,6 +7,7 @@ use crate::uefi::single_threaded::SingleThreaded;
 use arrayvec::ArrayVec;
 use hvdef::hypercall::EnablePartitionVtlFlags;
 use hvdef::hypercall::InitialVpContextX64;
+use hvdef::HvInterruptType;
 use hvdef::HvRegisterGuestVsmPartitionConfig;
 use hvdef::HvRegisterValue;
 use hvdef::HvRegisterVsmPartitionConfig;
@@ -57,7 +58,7 @@ impl HvcallPage {
 /// multi-threaded capacity (which the boot shim currently is not).
 pub struct HvCall {
     initialized: bool,
-    vtl: Vtl,
+    pub vtl: Vtl,
     input_page: HvcallPage,
     output_page: HvcallPage,
 }
@@ -105,6 +106,22 @@ impl HvCall {
         if !self.initialized {
             self.initialize();
         }
+    }
+
+    pub fn call_interrupt(&mut self) -> Result<(), hvdef::HvError> {
+        let z = hvdef::hypercall::AssertVirtualInterrupt {
+            partition_id: hvdef::HV_PARTITION_ID_SELF,
+            interrupt_control: hvdef::HvInterruptControl::new().with_interrupt_type(HvInterruptType::HvX64InterruptTypeInit ),
+            requested_vector: 0x30,
+            target_vtl: Vtl::Vtl1.into(),
+            destination_address: 0x0,
+            rsvd0: 0,
+            rsvd1: 0,
+        };
+
+        z.write_to_prefix(self.input_page().buffer.as_mut_slice());
+        let output = self.dispatch_hvcall(hvdef::HypercallCode::HvCallAssertVirtualInterrupt, None);
+        output.result()
     }
 
     pub fn initialize(&mut self) {
@@ -412,6 +429,7 @@ impl HvCall {
         let hvreg = self.get_register(hvdef::HvX64RegisterName::VsmPartitionConfig.into(), Some(vtl))?;
         let mut hvreg: HvRegisterVsmPartitionConfig = HvRegisterVsmPartitionConfig::from_bits(hvreg.as_u64());
         hvreg.set_enable_vtl_protection(true);
+        // hvreg.set_intercept_page(true);
         // hvreg.set_default_vtl_protection_mask(0b11);
         // hvreg.set_intercept_enable_vtl_protection(true);
         let bits = hvreg.into_bits();
