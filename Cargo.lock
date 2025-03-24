@@ -4783,6 +4783,7 @@ name = "opentmk"
 version = "0.0.0"
 dependencies = [
  "arrayvec",
+ "bitfield-struct",
  "cfg-if",
  "hvdef",
  "linked_list_allocator",

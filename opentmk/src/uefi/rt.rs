@@ -17,14 +17,14 @@ fn panic_handler(panic: &core::panic::PanicInfo<'_>) -> ! {
 
     let io = InstrIoAccess {};
     let mut ser = Mutex::new(Serial::new(io));
-    slog!(ser, "Panic at runtime: {}", panic);
+    crate::errorlog!("Panic at runtime: {}", panic);
     // If the system table is available, use UEFI's standard shutdown mechanism
     if uefi::table::system_table_raw().is_none() {
         use uefi::table::runtime::ResetType;
         uefi::runtime::reset(ResetType::SHUTDOWN, uefi::Status::ABORTED, None);
     }
 
-    slog!(ser, "Could not shut down... falling back to invoking an undefined instruction");
+    crate::errorlog!("Could not shut down... falling back to invoking an undefined instruction");
 
     // SAFETY: the undefined instruction trap handler in `guest_test_uefi` will not return
     unsafe {

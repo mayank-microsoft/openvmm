@@ -1,8 +1,6 @@
-use core::{arch::asm, cell::RefCell, fmt::Error, sync::atomic::AtomicBool};
+use core::{arch::asm, cell::{RefCell, UnsafeCell}, fmt::Error, sync::atomic::{AtomicBool, Ordering}};
 
-use alloc::{string::{String, ToString}, sync::Arc, vec::Vec};
-
-use crate::logt;
+use alloc::{boxed::Box, string::{String, ToString}, sync::Arc, vec::Vec};
 
 // pub struct LazyLock<T> {
 //     lock: AtomicBool,
@@ -42,70 +40,61 @@ use crate::logt;
 //     }
 // }
 
-#[derive(Debug)]
 pub struct Mutex<T> {
-    pub lock: AtomicBool,
-    pub val: T,
+    lock: AtomicBool,
+    data: UnsafeCell<T>,
 }
 
-pub struct Guard<'a, T> {
-    mutex: &'a mut Mutex<T>,
-}
+unsafe impl<T: Send> Sync for Mutex<T> {}
 
-impl<'a, T> Guard<'a, T> {
-    pub fn get(&self) -> &T {
-        &self.mutex.val
+impl<T> Mutex<T> {
+    pub const fn new(data: T) -> Self {
+        Mutex {
+            lock: AtomicBool::new(false),
+            data: UnsafeCell::new(data),
+        }
     }
 
-    pub fn get_mut(&mut self) -> &mut T {
-        &mut self.mutex.val
+    pub fn lock<'a>(&'a self) -> MutexGuard<'a, T> {
+        while self.lock.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            // Busy-wait until the lock is acquired
+            core::hint::spin_loop();
+        }
+        MutexGuard { mutex: self }
+    }
+
+    pub fn unlock(&self) {
+        self.lock.store(false, Ordering::Release);
     }
 }
 
-impl<'a, T> Drop for Guard<'a, T> {
+pub struct MutexGuard<'a, T> {
+    mutex: &'a Mutex<T>,
+}
+
+impl<'a, T> Drop for MutexGuard<'a, T> {
     fn drop(&mut self) {
         self.mutex.unlock();
     }
 }
 
-unsafe impl<T> Send for Mutex<T> {}
-unsafe impl<T> Sync for Mutex<T> {}
-impl<'a, T> Mutex<T> {
-    pub const fn new(val: T) -> Self {
-        Mutex {
-            lock: AtomicBool::new(false),
-            val,
-        }
-    }
+impl<'a, T> core::ops::Deref for MutexGuard<'a, T> {
+    type Target = T;
 
-    pub fn lock(&'a mut self) -> Guard<'a, T> {
-        loop {
-            let mut lk = self.lock.get_mut();
-            if !*lk {
-                *lk = true;
-                break;
-            }
-            core::hint::spin_loop();
-        }
-        Guard { mutex: self }
-    }
-
-    fn unlock(&mut self) {
-        let mut lk = self.lock.get_mut();
-        *lk = false;
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.mutex.data.get() }
     }
 }
 
-impl<T> Drop for Mutex<T> {
-    fn drop(&mut self) {
-        self.unlock();
+impl<'a, T> core::ops::DerefMut for MutexGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.mutex.data.get() }
     }
 }
-
 
 #[derive(Debug)]
 pub struct RingBuffer<T> {
-    buffer: Vec<T>,
+    buffer: Vec<Option<T>>,
     capacity: usize,
     head: usize,
     tail: usize,
@@ -137,15 +126,14 @@ impl<T> RingBuffer<T> {
         }
 
         if self.tail == self.buffer.len() {
-            self.buffer.push(item);
+            self.buffer.push(Some(item));
         } else {
-            self.buffer[self.tail] = item;
+            self.buffer[self.tail] = Some(item);
         }
 
         self.tail = (self.tail + 1) % self.capacity;
         self.size += 1;
 
-        logt!("Ok size: {}", self.size);
         Ok(())
     }
 
@@ -154,19 +142,11 @@ impl<T> RingBuffer<T> {
             return None;
         }
 
-        logt!("state[head]: {:?}", self.head);
-        logt!("state[cap]: {:?}", self.capacity);
-        logt!("state[sz]: {:?}", self.size);
-        logt!("state[len]: {:?}", self.buffer.len());
-        
-        let item = core::mem::replace(&mut self.buffer[self.head], unsafe {
-            core::mem::zeroed()
-        });
-
+        let item = core::mem::replace(&mut self.buffer[self.head], None);
         self.head = (self.head + 1) % self.capacity;
         self.size -= 1;
 
-        Some(item)
+        Some(item.unwrap())
     }
 
     pub fn len(&self) -> usize {
@@ -175,37 +155,103 @@ impl<T> RingBuffer<T> {
 }
 
 
+pub struct Deque<T> {
+    data: Vec<T>,
+}
+
+impl<T> Deque<T> {
+    pub fn new() -> Self {
+        Deque {
+            data: Vec::new(),
+        }
+    }
+
+    pub fn push_front(&mut self, value: T) {
+        self.data.insert(0, value);
+    }
+
+    pub fn push_back(&mut self, value: T) {
+        self.data.push(value);
+    }
+
+    pub fn pop_front(&mut self) -> Option<T> {
+        if self.data.is_empty() {
+            None
+        } else {
+            Some(self.data.remove(0))
+        }
+    }
+
+    pub fn pop_back(&mut self) -> Option<T> {
+        self.data.pop()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn clear(&mut self) {
+        self.data.clear();
+    }
+
+    pub fn front(&self) -> Option<&T> {
+        self.data.first()
+    }
+
+    pub fn back(&self) -> Option<&T> {
+        self.data.last()
+    }
+}
+
 pub struct Channel<T> {
-    buffer: Arc<Mutex<RingBuffer<T>>>,
+    buffer: Arc<Mutex<Deque<T>>>,
+    capacity: usize,
 }
 
 // implement clone for Channel
 impl<T> Clone for Channel<T> {
     fn clone(&self) -> Self {
-        Channel { buffer: self.buffer.clone() }
+        Channel { buffer: self.buffer.clone(), capacity: self.capacity }
     }
 }
 
 
 //  a Sender and Receiver pair
-pub struct Sender<'a,T> {
-    channel: &'a mut Channel<T>,
+pub struct Sender<T> {
+    channel: Channel<T>,
 }
 
-pub struct Receiver<'a, T> {
-    channel: &'a mut Channel<T>,
+pub struct Receiver<T> {
+    channel: Channel<T>,
 }
-impl<'a, T> Sender<'a, T> {
-    pub fn new(channel: &'a mut Channel<T>) -> Self {
+
+
+impl< T> Sender<T> {
+    pub fn new(channel: Channel<T>) -> Self {
         Sender { channel }
     }
 
     pub fn send(&mut self, item: T) -> Result<(), String> {
         self.channel.send(item)
     }
+
+    pub fn send_priority(&mut self, item: T) -> Result<(), String> {
+        self.channel.send_priority(item)
+    }
 }
-impl<'a, T> Receiver<'a, T> {
-    pub fn new(channel:&'a mut Channel<T>) -> Self {
+
+impl< T> Clone for Sender<T> {
+    fn clone(&self) -> Self {
+        Sender { channel: self.channel.clone() }
+    }
+}
+
+impl< T> Receiver< T> {
+    pub fn new(channel: Channel<T>) -> Self {
         Receiver { channel }
     }
 
@@ -214,19 +260,37 @@ impl<'a, T> Receiver<'a, T> {
     }
 }
 
+impl <T> Clone for Receiver<T> {
+    fn clone(&self) -> Self {
+        Receiver { channel: self.channel.clone() }
+    }
+}
+
+
 impl<T> Channel<T> {
-    pub fn new<'a>(capacity: usize) -> Self {
+    pub fn new<'a>(capacity: usize) -> (Sender<T>, Receiver<T>) {
         let mut ch: Channel<T> = Channel {
-            buffer: Arc::new(Mutex::new(RingBuffer::new(capacity))),
+            buffer: Arc::new(Mutex::new(Deque::new())),
+            capacity,
         };
-        ch
+        let sender = Sender::new(ch.clone());
+        let receiver = Receiver::new(ch.clone());
+        (sender, receiver)
     }
 
     fn send(&mut self, item: T) -> Result<(), String> {
-        let mut buffer = &mut *self.buffer  ;
-
         let mut buffer = self.buffer.lock();
-        buffer.get_mut().push(item)
+        if buffer.len() >= self.capacity {
+            return Err("Buffer is full".to_string());
+        }
+        buffer.push_back(item);
+        Ok(())
+    }
+    
+    fn send_priority(&mut self, item: T) -> Result<(), String> {
+        let mut buffer = self.buffer.lock();
+        buffer.push_front(item);
+        Ok(())
     }
 
     fn recv(&mut self) -> T {
@@ -242,9 +306,8 @@ impl<T> Channel<T> {
                 asm!("nop");
             }
             let mut buffer = self.buffer.lock();
-            logt!("recv1");
-            if !buffer.get_mut().pop().is_none() {
-                return buffer.get_mut().pop().unwrap();
+            if let Some(item) = buffer.pop_front() {
+                return item;
             }
             core::hint::spin_loop();
         }
