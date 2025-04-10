@@ -227,6 +227,7 @@ impl TestCtx {
                                     ),
                                     Some(vp_context),
                                 );
+                                infolog!("end for vp: {}", vp_index);
                             }),
                             Vtl::Vtl1,
                         ));
@@ -261,15 +262,22 @@ impl TestCtx {
     }
 }
 
+
+
+
 #[entry]
 fn uefi_main() -> Status {
     init().expect("Failed to initialize environment");
-
     let mut ctx = TestCtx::new();
     ctx.init();
 
     let h = read_idtr(&mut ctx.hvcall);
     set_int_handler(h, 0x30);
+    infolog!("set intercept handler successfully!");
+    let mut vp_context = ctx
+        .hvcall
+        .get_current_vtl_vp_context()
+        .expect("Failed to get VTL1 context");
     let result = ctx
         .hvcall
         .enable_partition_vtl(hvdef::HV_PARTITION_ID_SELF, Vtl::Vtl1);
@@ -291,73 +299,71 @@ fn uefi_main() -> Status {
     }
 
     let register_value: HvRegisterVsmPartitionStatus = register_value.unwrap().as_u64().into();
-    infolog!("Register value: {:?}", register_value);
+    infolog!("Register value for vsm status: {:?}", register_value);
 
     ctx.start_on_vp(0, Vtl::Vtl1, move |ctx| {
         let hvcall = &mut ctx.hvcall;
-        infolog!("Hello from VTL1!");
+        infolog!("successfully started running VTL1 on vp0.");
         let layout = Layout::from_size_align(4096, 4096).expect("msg: failed to create layout");
         let ptr = unsafe { ALLOCATOR.alloc(layout) };
         let gpn = (ptr as u64) >> 12;
         let reg = (gpn << 12) | 0x1;
         unsafe { write_msr(hvdef::HV_X64_MSR_SIMP, reg.into()) };
-        // if let Ok(_) = hvcall.call_interrupt() {
-        //     infolog!("Interrupt called successfully!");
-        // } else {
-        //     infolog!("Failed to call interrupt!");
-        // }
         let reg = unsafe { read_msr(hvdef::HV_X64_MSR_SINT0) };
+        
+        infolog!("Successfuly set the SIMP register.");
+
         let mut reg: hvdef::HvSynicSint = reg.into();
-        infolog!("Register value: {:?}", reg);
         reg.set_vector(0x30);
         reg.set_masked(false);
         reg.set_auto_eoi(true);
 
         unsafe { write_msr(hvdef::HV_X64_MSR_SINT0, reg.into()) };
 
-        let reg = unsafe { read_msr(hvdef::HV_X64_MSR_SINT0) };
-        let mut reg: hvdef::HvSynicSint = reg.into();
+        infolog!("Successfuly set the SINT0 register.");
 
-        let reg = hvcall
-            .get_register(HvX64RegisterName::Sint0.into(), None)
-            .unwrap()
-            .as_table();
+        let reg = unsafe { read_msr(hvdef::HV_X64_MSR_SINT0) };
+
         let layout = Layout::from_size_align(SIZE_1MB, 4096).expect("msg: failed to create layout");
         let ptr = unsafe { ALLOCATOR.alloc(layout) };
+        infolog!("allocated some memory in the heap from vtl1");
         unsafe {
             let mut z = HEAPX.borrow_mut();
             *z = ptr;
             *ptr.add(10) = 0xAA;
         }
+
         let size = layout.size();
-        infolog!("Hello from VTL1!");
         let reg = hvcall
             .enable_vtl_protection(0, HvInputVtl::CURRENT_VTL)
             .expect("Failed to enable VTL protection, vtl1");
+
+        infolog!("enabled vtl protections for the partition.");
+
         let range = Range {
             start: ptr as u64,
             end: ptr as u64 + size as u64,
         };
-        infolog!("Range: {:?}", range);
         let r = hvcall.apply_vtl_protections(MemoryRange::new(range), Vtl::Vtl1);
         if let Ok(_) = r {
-            infolog!("APPLY SUCCESS!");
+            infolog!("successfully applied VTL protections for the allocated memory pages");
         } else {
-            infolog!("APPLY FAILED!");
+            infolog!("failed to apply VTL protections for the allocated memory pages");
             infolog!("Error: {:?}", r.err());
         }
-        infolog!("moving to VTL0");
+        infolog!("moving to vtl0 to attempt to read the heap memory");
         HvCall::low_vtl();
     });
 
     ctx.queue_command_vp(0, Vtl::Vtl1, move |ctx| {
-        infolog!("called after interrupt!");
         HvCall::low_vtl();
     });
 
     unsafe {
+        infolog!("Attempting to read heap memory from vtl0");
         let heapx = *HEAPX.borrow();
         let val = *(heapx.add(10));
+        infolog!("reading mutated heap memory from vtl0(it should not be 0xAA): 0x{:x}", val);
         tmk_assert!(val != 0xAA);
     }
 
@@ -399,7 +405,6 @@ fn uefi_main() -> Status {
         let mut tx = tx.clone();
         ctx.start_on_vp(2, Vtl::Vtl1, move |ctx| {
             infolog!("Hello form vtl1 on vp2!");
-            infolog!("Hello from {:?} on vp2!", ctx.hvcall.vtl);
             tx.send(());
         });
     }
@@ -407,7 +412,7 @@ fn uefi_main() -> Status {
     rx.recv();
     rx.recv();
 
-    infolog!("Hello from VTL0!");
+    infolog!("we reached the end of the test");
 
     Status::SUCCESS
 }
