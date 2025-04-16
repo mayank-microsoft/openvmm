@@ -3,10 +3,7 @@ use core::{
     cell::RefCell,
 };
 
-use crate::{
-    infolog,
-    uefi::{hypercall::HvCall, init::interrupt_rsp_ptr},
-};
+use crate::{infolog, uefi::hypercall::HvCall};
 use alloc::vec::Vec;
 use bitfield_struct::bitfield;
 
@@ -26,99 +23,81 @@ fn call_action() {
     infolog!("Interrupt called!\n");
 }
 
-// global_asm!(r#"
-//     section .data
-//     .global gpr_values
-//     gpr_values: 
-//         times 16 dq 0 
-//     .global xmm_values
-//     xmm_values: 
-//         times 32 dq 0
-// "#);
-
-#[no_mangle]
-static mut gpr_values: [u64; 16] = [0; 16];
-
-#[no_mangle]
-static mut xmm_values: [u128; 16] = [0; 16];
-
-
 #[naked]
 fn interrupt_handler() {
     unsafe {
         naked_asm!(r#"
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push rsp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
+        push rax
+        push rbx
+        push rcx
+        push rdx
+        push rsi
+        push rdi
+        push rbp
+        push rsp
+        push r8
+        push r9
+        push r10
+        push r11
+        push r12
+        push r13
+        push r14
+        push r15
 
-    sub rsp, 256  
-    movups [rsp + 16 * 0], xmm0
-    movups [rsp + 16 * 1], xmm1
-    movups [rsp + 16 * 2], xmm2
-    movups [rsp + 16 * 3], xmm3
-    movups [rsp + 16 * 4], xmm4
-    movups [rsp + 16 * 5], xmm5
-    movups [rsp + 16 * 6], xmm6
-    movups [rsp + 16 * 7], xmm7
-    movups [rsp + 16 * 8], xmm8
-    movups [rsp + 16 * 9], xmm9
-    movups [rsp + 16 * 10], xmm10
-    movups [rsp + 16 * 11], xmm11
-    movups [rsp + 16 * 12], xmm12
-    movups [rsp + 16 * 13], xmm13
-    movups [rsp + 16 * 14], xmm14
-    movups [rsp + 16 * 15], xmm15
-    
-    call {fnc}
+        sub rsp, 256  
+        movups [rsp + 16 * 0], xmm0
+        movups [rsp + 16 * 1], xmm1
+        movups [rsp + 16 * 2], xmm2
+        movups [rsp + 16 * 3], xmm3
+        movups [rsp + 16 * 4], xmm4
+        movups [rsp + 16 * 5], xmm5
+        movups [rsp + 16 * 6], xmm6
+        movups [rsp + 16 * 7], xmm7
+        movups [rsp + 16 * 8], xmm8
+        movups [rsp + 16 * 9], xmm9
+        movups [rsp + 16 * 10], xmm10
+        movups [rsp + 16 * 11], xmm11
+        movups [rsp + 16 * 12], xmm12
+        movups [rsp + 16 * 13], xmm13
+        movups [rsp + 16 * 14], xmm14
+        movups [rsp + 16 * 15], xmm15
+        
+        call {fnc}
 
-    movups xmm0, [rsp + 16 * 0]
-    movups xmm1, [rsp + 16 * 1]
-    movups xmm2, [rsp + 16 * 2]
-    movups xmm3, [rsp + 16 * 3]
-    movups xmm4, [rsp + 16 * 4]
-    movups xmm5, [rsp + 16 * 5]
-    movups xmm6, [rsp + 16 * 6]
-    movups xmm7, [rsp + 16 * 7]
-    movups xmm8, [rsp + 16 * 8]
-    movups xmm9, [rsp + 16 * 9]
-    movups xmm10, [rsp + 16 * 10]
-    movups xmm11, [rsp + 16 * 11]
-    movups xmm12, [rsp + 16 * 12]
-    movups xmm13, [rsp + 16 * 13]
-    movups xmm14, [rsp + 16 * 14]
-    movups xmm15, [rsp + 16 * 15]
-    add rsp, 16 * 16  
+        movups xmm0, [rsp + 16 * 0]
+        movups xmm1, [rsp + 16 * 1]
+        movups xmm2, [rsp + 16 * 2]
+        movups xmm3, [rsp + 16 * 3]
+        movups xmm4, [rsp + 16 * 4]
+        movups xmm5, [rsp + 16 * 5]
+        movups xmm6, [rsp + 16 * 6]
+        movups xmm7, [rsp + 16 * 7]
+        movups xmm8, [rsp + 16 * 8]
+        movups xmm9, [rsp + 16 * 9]
+        movups xmm10, [rsp + 16 * 10]
+        movups xmm11, [rsp + 16 * 11]
+        movups xmm12, [rsp + 16 * 12]
+        movups xmm13, [rsp + 16 * 13]
+        movups xmm14, [rsp + 16 * 14]
+        movups xmm15, [rsp + 16 * 15]
+        add rsp, 16 * 16  
 
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rsp
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-
+        pop r15
+        pop r14
+        pop r13
+        pop r12
+        pop r11
+        pop r10
+        pop r9
+        pop r8
+        pop rsp
+        pop rbp
+        pop rdi
+        pop rsi
+        pop rdx
+        pop rcx
+        pop rbx
+        pop rax
         iretq
     "#,fnc = sym call_action);
     };
@@ -183,7 +162,6 @@ pub fn set_int_handler(idt: Vec<*mut InterruptDescriptor64>, interrupt_idx: u8) 
     idt_entry.offset_mid = ((handler >> 16) & 0b1111111111111111) as u16;
     idt_entry.offset_low = (handler & 0b1111111111111111) as u16;
     idt_entry.type_attr |= 0b1110;
-    // idt_entry.ist = 1;
     unsafe {
         asm!("sti");
     }

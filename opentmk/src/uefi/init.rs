@@ -6,12 +6,6 @@ use crate::infolog;
 
 use super::{alloc::ALLOCATOR};
 
-#[allow(non_upper_case_globals)]
-pub static mut interrupt_rsp_ptr: *mut u8 = 0 as *mut u8;
-#[allow(non_upper_case_globals)]
-pub static mut interrupt_rsp_start : *mut u8 = 0 as *mut u8;
-
-
 
 fn enable_uefi_vtl_protection() {
     let mut buf = vec![0u8; 1024];
@@ -71,22 +65,6 @@ fn enable_uefi_vtl_protection() {
     let _ = unsafe { exit_boot_services(MemoryType::BOOT_SERVICES_DATA) };
 }
 
-fn allocate_interrupt_stack() -> *mut u8 {
-    let layout: Layout = Layout::from_size_align(4096, 4096).expect("msg: failed to create layout");
-    let ptr = unsafe { ALLOCATOR.alloc(layout) };
-    unsafe { interrupt_rsp_start = ptr };
-    let ptr = unsafe { ptr.add(4096) };
-    unsafe { interrupt_rsp_ptr = ptr };
-    ptr
-}
-
-
-fn unallocate_interrupt_stack() {
-    let layout = Layout::from_size_align(4096, 4096).expect("msg: failed to create layout");
-    unsafe { ALLOCATOR.dealloc(interrupt_rsp_start, layout) };
-    unsafe { interrupt_rsp_ptr = 0 as *mut u8 };
-}
-
 pub fn init() -> Result<(), Status> {
     let r: bool = unsafe { ALLOCATOR.init(1024) };
     if r == false {
@@ -94,7 +72,6 @@ pub fn init() -> Result<(), Status> {
         println!("Failed to initialize allocator!");
         return Err(Status::ABORTED);
     }
-    allocate_interrupt_stack();
     enable_uefi_vtl_protection();
     Ok(())
 }

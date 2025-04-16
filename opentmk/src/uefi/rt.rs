@@ -10,7 +10,7 @@
 use crate::arch::serial::{Serial, InstrIoAccess};
 use core::fmt::Write;
 use crate::slog;
-use crate::uefi::Mutex;
+use crate::sync::Mutex;
 
 #[panic_handler]
 fn panic_handler(panic: &core::panic::PanicInfo<'_>) -> ! {
