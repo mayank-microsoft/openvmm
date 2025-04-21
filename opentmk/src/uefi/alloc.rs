@@ -1,20 +1,20 @@
 use core::{alloc::GlobalAlloc, cell::RefCell};
 
 use linked_list_allocator::LockedHeap;
+use spin::mutex::Mutex;
 use uefi::{allocator::Allocator, boot::{self, AllocateType, MemoryType}};
-use super::single_threaded::SingleThreaded;
 
 pub const SIZE_1MB: usize  = 1024 * 1024;
 
 #[global_allocator]
 pub static ALLOCATOR: MemoryAllocator = MemoryAllocator {
-    use_locked_heap: SingleThreaded(RefCell::new(false)),
+    use_locked_heap: Mutex::new(RefCell::new(false)),
     locked_heap: LockedHeap::empty(),
     uefi_allocator: Allocator{},
 };
 
 pub struct MemoryAllocator {
-    use_locked_heap: SingleThreaded<RefCell<bool>>,
+    use_locked_heap: Mutex<RefCell<bool>>,
     locked_heap: LockedHeap,
     uefi_allocator: Allocator,
 }
@@ -23,7 +23,7 @@ pub struct MemoryAllocator {
 unsafe impl GlobalAlloc for MemoryAllocator {
     #[allow(unsafe_code)]
     unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
-        if *self.use_locked_heap.0.borrow() {
+        if *self.use_locked_heap.lock().borrow() {
            unsafe { self.locked_heap.alloc(layout) }
         } else {
             unsafe { self.uefi_allocator.alloc(layout) }
@@ -31,7 +31,7 @@ unsafe impl GlobalAlloc for MemoryAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
-        if *self.use_locked_heap.0.borrow() {
+        if *self.use_locked_heap.lock().borrow() {
             unsafe { self.locked_heap.dealloc(ptr, layout) }
         } else {
             unsafe { self.uefi_allocator.dealloc(ptr, layout) }
@@ -39,7 +39,7 @@ unsafe impl GlobalAlloc for MemoryAllocator {
     }
     
     unsafe fn alloc_zeroed(&self, layout: core::alloc::Layout) -> *mut u8 {
-        if *self.use_locked_heap.0.borrow() {
+        if *self.use_locked_heap.lock().borrow() {
             unsafe { self.locked_heap.alloc_zeroed(layout) }
          } else {
              unsafe { self.uefi_allocator.alloc_zeroed(layout) }
@@ -47,7 +47,7 @@ unsafe impl GlobalAlloc for MemoryAllocator {
     }
     
     unsafe fn realloc(&self, ptr: *mut u8, layout: core::alloc::Layout, new_size: usize) -> *mut u8 {
-        if *self.use_locked_heap.0.borrow() {
+        if *self.use_locked_heap.lock().borrow() {
             unsafe { self.locked_heap.realloc(ptr, layout, new_size) }
          } else {
              unsafe { self.uefi_allocator.realloc(ptr, layout, new_size) }
@@ -69,8 +69,7 @@ impl MemoryAllocator {
         unsafe {
             self.locked_heap.lock().init(ptr, size);
         }
-        let mut flag = self.use_locked_heap.0.borrow_mut();
-        *flag = true;
+        *self.use_locked_heap.lock().borrow_mut() = true;
         return true;
     }
 

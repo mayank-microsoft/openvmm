@@ -15,10 +15,12 @@ zerocopy = {workspace = true}
 memory_range = { workspace = true }
 arrayvec = {workspace = true}
 cfg-if.workspace  = true
-serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 bitfield-struct.workspace = true
 x86_64 = "0.15.2"
-
+lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+spin = "0.10.0"
+serde = {version = "1.0", default-features = false}
 [lints]
 workspace = true
 

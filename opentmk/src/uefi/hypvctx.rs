@@ -1,27 +1,36 @@
+use super::{
+    context::{TestCtxTrait, VpExecutor},
+    hypercall::HvCall,
+};
+use crate::{debuglog, slog::AssertResult};
+use crate::uefi::alloc::ALLOCATOR;
+use crate::{
+    infolog,
+    slog::AssertOption,
+    sync::{Channel, Receiver, Sender},
+};
+use alloc::collections::btree_map::BTreeMap;
+use alloc::collections::linked_list::LinkedList;
 use alloc::{boxed::Box, vec::Vec};
-use memory_range::MemoryRange;
 use core::alloc::{GlobalAlloc, Layout};
+use core::arch::asm;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
-use hvdef::{Vtl};
 use hvdef::hypercall::{HvInputVtl, InitialVpContextX64};
+use hvdef::{HvAllArchRegisterName, HvRegisterName, Vtl};
+use memory_range::MemoryRange;
 use minimal_rt::arch::msr::{read_msr, write_msr};
-use crate::slog::AssertResult;
-use crate::uefi::alloc::ALLOCATOR;
-use crate::{infolog, slog::AssertOption, sync::{Channel, Receiver, Sender}};
-use crate::arch::interrupt::{read_idtr, set_int_handler};
-use super::{context::{TestCtxTrait, VpExecutor}, hypercall::HvCall};
+use spin::Mutex;
 
 const ALIGNMENT: usize = 4096;
 
-static mut COMMAND_TABLE: Vec<(
-    u64,
-    (
-        Receiver<(Box<dyn FnOnce(&mut dyn TestCtxTrait) + 'static>, Vtl)>,
-        Sender<(Box<dyn FnOnce(&mut dyn TestCtxTrait) + 'static>, Vtl)>,
-    ),
-)> = Vec::new();
+type ComandTable =
+    BTreeMap<u32, LinkedList<(Box<dyn FnOnce(&mut dyn TestCtxTrait) + 'static>, Vtl)>>;
+static mut CMD: Mutex<ComandTable> = Mutex::new(BTreeMap::new());
 
+fn cmdt() -> &'static Mutex<ComandTable> {
+    unsafe { &CMD }
+}
 
 struct VpContext {
     #[cfg(target_arch = "x86_64")]
@@ -30,23 +39,21 @@ struct VpContext {
     ctx: InitialVpContextAarch64,
 }
 
-
 fn register_command_queue(vp_index: u32) {
     unsafe {
-        let (send, rcsv) = Channel::new(10);
-        COMMAND_TABLE.push((vp_index as u64, (rcsv, send.clone())));
+        debuglog!("registering command queue for vp: {}", vp_index);
+        if CMD.lock().get(&vp_index).is_none() {
+            CMD.lock().insert(vp_index, LinkedList::new());
+            debuglog!("registered command queue for vp: {}", vp_index);
+        } else {
+            debuglog!(
+                "command queue already registered for vp: {}",
+                vp_index
+            );
+        }
     }
 }
 
-fn get_vp_sender(vp_index: u32) -> Sender<(Box<dyn FnOnce(&mut dyn TestCtxTrait) + 'static>, Vtl)> {
-    let mut cmd = unsafe {
-        COMMAND_TABLE
-            .iter_mut()
-            .find(|cmd| cmd.0 == vp_index as u64)
-            .expect("error: failed to find command queue")
-    };
-    cmd.1 .1.clone()
-}
 pub struct HvTestCtx {
     pub hvcall: HvCall,
     pub vp_runing: Vec<(u32, (bool, bool))>,
@@ -54,7 +61,11 @@ pub struct HvTestCtx {
     senders: Vec<(u64, Sender<(Box<dyn FnOnce(&mut HvCall)>, Vtl)>)>,
 }
 
-
+impl Drop for HvTestCtx {
+    fn drop(&mut self) {
+        self.hvcall.uninitialize();
+    }
+}
 
 impl TestCtxTrait for HvTestCtx {
     fn start_on_vp(&mut self, cmd: VpExecutor) {
@@ -66,49 +77,36 @@ impl TestCtxTrait for HvTestCtx {
         let is_vp_running = self.vp_runing.iter_mut().find(|x| x.0 == vp_index);
 
         if let Some(running_vtl) = is_vp_running {
-            infolog!("both vtl0 and vtl1 are running for VP: {:?}", vp_index);
+            debuglog!("both vtl0 and vtl1 are running for VP: {:?}", vp_index);
         } else {
             if vp_index == 0 {
-                // infolog!("INFO: starting VTL1 for VP: {:?}", vp_index);
                 let vp_context = self
                     .get_default_context()
                     .expect("error: failed to get default context");
-                register_command_queue(vp_index);
                 self.hvcall
                     .enable_vp_vtl(0, Vtl::Vtl1, Some(vp_context))
                     .expect("error: failed to enable vtl1");
 
-                let mut sender = get_vp_sender(vp_index);
-
-                sender.send((
-                    Box::new(move |hvcall| {
-                        HvCall::low_vtl();
+                cmdt().lock().get_mut(&vp_index).unwrap().push_back((
+                    Box::new(move |ctx| {
+                        ctx.switch_to_low_vtl();
                     }),
                     Vtl::Vtl1,
                 ));
-                HvCall::high_vtl();
+                self.switch_to_high_vtl();
                 self.vp_runing.push((vp_index, (true, true)));
             } else {
-                let mut priv_vtl_sender = get_vp_sender(self.my_vp_idx);
-                register_command_queue(vp_index);
                 let my_idx = self.my_vp_idx;
-                priv_vtl_sender.send((
+                cmdt().lock().get_mut(&self.my_vp_idx).unwrap().push_back((
                     Box::new(move |ctx| {
                         ctx.enable_vp_vtl_with_default_context(vp_index, Vtl::Vtl1);
                         ctx.start_running_vp_with_default_context(VpExecutor::new(
                             vp_index,
                             Vtl::Vtl1,
                         ));
-                        let mut vp_sender = get_vp_sender(vp_index);
-                        vp_sender.send((
+                        cmdt().lock().get_mut(&vp_index).unwrap().push_back((
                             Box::new(move |ctx| {
-                                infolog!(
-                                    "INFO: starting VTL1 for VP: {:?} from idx: {}",
-                                    vp_index,
-                                    my_idx
-                                );
                                 ctx.set_default_ctx_to_vp(vp_index, Vtl::Vtl0);
-                                infolog!("end for vp: {}", vp_index);
                             }),
                             Vtl::Vtl1,
                         ));
@@ -121,8 +119,11 @@ impl TestCtxTrait for HvTestCtx {
                 self.vp_runing.push((vp_index, (true, true)));
             }
         }
-        let mut sender = get_vp_sender(vp_index);
-        sender.send((cmd, vtl));
+        cmdt()
+            .lock()
+            .get_mut(&vp_index)
+            .unwrap()
+            .push_back((cmd, vtl));
         if vp_index == self.my_vp_idx && self.hvcall.vtl != vtl {
             if vtl == Vtl::Vtl0 {
                 self.switch_to_low_vtl();
@@ -136,8 +137,11 @@ impl TestCtxTrait for HvTestCtx {
         let (vp_index, vtl, cmd) = cmd.get();
         let cmd =
             cmd.expect_assert("error: failed to get command as cmd is none with queue command vp");
-        let mut sender = get_vp_sender(vp_index);
-        sender.send((cmd, vtl));
+        cmdt()
+            .lock()
+            .get_mut(&vp_index)
+            .unwrap()
+            .push_back((cmd, vtl));
     }
 
     fn switch_to_high_vtl(&mut self) {
@@ -155,8 +159,7 @@ impl TestCtxTrait for HvTestCtx {
         infolog!("enabled vtl protections for the partition.");
     }
     fn setup_interrupt_handler(&mut self) {
-        let idt = read_idtr(&mut self.hvcall);
-        set_int_handler(idt, 0x30);
+        crate::arch::interrupt::init();
     }
 
     fn setup_vtl_protection(&mut self) {
@@ -243,9 +246,64 @@ impl TestCtxTrait for HvTestCtx {
             .enable_vp_vtl(vp_index, vtl, Some(vp_ctx))
             .expect_assert("error: failed to enable vp vtl");
     }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_interupt_idx(&mut self, interrupt_idx: u8, handler: fn()) {
+        crate::arch::interrupt::set_handler(interrupt_idx, handler);
+    }
+
+    fn get_vp_count(&self) -> u32 {
+        let mut result: u32 = 0;
+
+        unsafe {
+            // Call CPUID with EAX=1, but work around the rbx constraint
+            asm!(
+                "push rbx",                      // Save rbx
+                "cpuid",                         // Execute CPUID
+                "mov {result}, rbx",                // Store ebx to our result variable
+                "pop rbx",                       // Restore rbx
+                in("eax") 1u32,                 // Input: CPUID leaf 1
+                out("ecx") _,                   // Output registers (not used)
+                out("edx") _,                   // Output registers (not used)
+                result = out(reg) result,                // Output: result from ebx
+                options(nomem, nostack)
+            );
+        }
+
+        // Extract logical processor count from bits [23:16]
+        (result >> 16) & 0xFF
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn get_register(&mut self, reg: u32) -> u128 {
+        use hvdef::HvX64RegisterName;
+
+        let reg = HvX64RegisterName(reg);
+        self.hvcall
+            .get_register(reg.into(), None)
+            .expect_assert("error: failed to get register")
+            .as_u128()
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn get_register(&mut self, reg: u32) -> u128 {
+        use hvdef::HvAarch64RegisterName;
+
+        let reg = HvAarch64RegisterName(reg);
+        self.hvcall
+            .get_register(reg.into(), None)
+            .expect_assert("error: failed to get register")
+            .as_u128()
+    }
+
+    fn get_current_vp(&self) -> u32 {
+        self.my_vp_idx
+    }
+
+    fn get_current_vtl(&self) -> Vtl {
+        self.hvcall.vtl
+    }
 }
-
-
 
 impl HvTestCtx {
     pub const fn new() -> Self {
@@ -259,6 +317,10 @@ impl HvTestCtx {
 
     pub fn init(&mut self) {
         self.hvcall.initialize();
+        let vp_count = self.get_vp_count();
+        for i in 0..vp_count {
+            register_command_queue(i);
+        }
     }
 
     fn exec_handler() {
@@ -271,24 +333,36 @@ impl HvTestCtx {
         let reg = reg.as_u64();
         ctx.my_vp_idx = reg as u32;
 
-        let mut _cmd = unsafe {
-            COMMAND_TABLE
-                .iter_mut()
-                .find(|cmd| cmd.0 == ctx.my_vp_idx as u64)
-                .expect("error: failed to find command queue")
-        };
-
         loop {
-            let (cmd, vtl) = _cmd.1 .0.recv();
-            if (vtl != ctx.hvcall.vtl) {
-                // NOT USE PRIORITY ELSEWHERE
-                _cmd.1 .1.send_priority((cmd, vtl));
-                if (vtl == Vtl::Vtl0) {
-                    HvCall::low_vtl();
-                } else {
-                    HvCall::high_vtl();
+            let mut vtl: Option<Vtl> = None;
+            let mut cmd: Option<Box<dyn FnOnce(&mut dyn TestCtxTrait) + 'static>> = None;
+
+            {
+                let mut d = unsafe { CMD.lock() };
+                let mut d = d.get_mut(&ctx.my_vp_idx);
+                if d.is_some() {
+                    let mut d = d.unwrap();
+                    if !d.is_empty() {
+                        let (c, v) = d.front().unwrap();
+                        if *v == ctx.hvcall.vtl {
+                            let (c, v) = d.pop_front().unwrap();
+                            cmd = Some(c);
+                        } else {
+                            vtl = Some(*v);
+                        }
+                    }
                 }
-            } else {
+            }
+
+            if let Some(vtl) = vtl {
+                if (vtl == Vtl::Vtl0) {
+                    ctx.switch_to_low_vtl();
+                } else {
+                    ctx.switch_to_high_vtl();
+                }
+            }
+
+            if let Some(cmd) = cmd {
                 cmd(&mut ctx);
             }
         }

@@ -9,7 +9,7 @@ use crate::sync::Mutex;
 use alloc::string::{String, ToString};
 #[no_std]
 use serde_json::json;
-
+use serde::Serialize;
 pub enum Level {
     DEBUG = 0,
     INFO = 1,
@@ -37,13 +37,13 @@ pub fn get_json_string(s: &String, terminate_new_line: bool, level: Level) -> St
     return out;
 }
 
-pub fn get_json_test_assertion_string(
+pub fn get_json_test_assertion_string<T>(
     s: &str,
     terminate_new_line: bool,
     line: String,
     assert_result: bool,
-    testname: &str,
-) -> String {
+    testname: &T,
+) -> String where T: Serialize {
     let out = json!({
         "type:": "assertion",
         "message": s,
@@ -70,12 +70,11 @@ macro_rules! tmk_assert {
         let file_line = format!("{}:{}", file, line);
         let expn = stringify!($condition);
         let result: bool = $condition;
-        let message: &str = $message;
         let js =
-            crate::slog::get_json_test_assertion_string(&expn, true, file_line, result, message);
+            crate::slog::get_json_test_assertion_string(&expn, true, file_line, result, &$message);
         unsafe { crate::slog::SERIAL.write_str(&js) };
         if !result {
-            panic!("Assertion failed: {}", message);
+            panic!("Assertion failed: {}", $message);
         }
     }};
 }
@@ -189,7 +188,7 @@ impl<T> AssertOption<T> for Option<T> {
                 let file_line = format!("{}:{}", call.file(), call.line());
                 let expn = type_name::<Option<T>>();
                 let js = crate::slog::get_json_test_assertion_string(
-                    expn, true, file_line, false, message,
+                    expn, true, file_line, false, &message,
                 );
                 unsafe { crate::slog::SERIAL.write_str(&js) };
                 panic!("Assertion failed: {}", message);
@@ -214,7 +213,7 @@ where
                     true,
                     file_line,
                     false,
-                    "ResultTest",
+                    &"ResultTest",
                 );
                 unsafe { crate::slog::SERIAL.write_str(&js) };
                 panic!("Assertion failed: {:?}", err);
@@ -232,7 +231,7 @@ where
                 let file_line = format!("{}:{}", call.file(), call.line());
                 let expn = type_name::<Result<T, E>>();
                 let js = crate::slog::get_json_test_assertion_string(
-                    expn, true, file_line, false, message,
+                    expn, true, file_line, false, &message,
                 );
                 unsafe { crate::slog::SERIAL.write_str(&js) };
 

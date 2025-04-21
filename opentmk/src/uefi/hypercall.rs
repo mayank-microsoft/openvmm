@@ -3,7 +3,6 @@
 
 //! Hypercall infrastructure.
 
-use crate::uefi::single_threaded::SingleThreaded;
 use arrayvec::ArrayVec;
 use hvdef::hypercall::EnablePartitionVtlFlags;
 use hvdef::hypercall::InitialVpContextX64;
@@ -86,7 +85,6 @@ impl HvCall {
         
     }
     fn input_page(&mut self) -> &mut HvcallPage {
-        // SAFETY: `HVCALL` owns the input page.
         &mut self.input_page
     }
 
@@ -106,22 +104,6 @@ impl HvCall {
         if !self.initialized {
             self.initialize();
         }
-    }
-
-    pub fn call_interrupt(&mut self) -> Result<(), hvdef::HvError> {
-        let z = hvdef::hypercall::AssertVirtualInterrupt {
-            partition_id: hvdef::HV_PARTITION_ID_SELF,
-            interrupt_control: hvdef::HvInterruptControl::new().with_interrupt_type(HvInterruptType::HvX64InterruptTypeInit ),
-            requested_vector: 0x30,
-            target_vtl: Vtl::Vtl1.into(),
-            destination_address: 0x0,
-            rsvd0: 0,
-            rsvd1: 0,
-        };
-
-        z.write_to_prefix(self.input_page().buffer.as_mut_slice());
-        let output = self.dispatch_hvcall(hvdef::HypercallCode::HvCallAssertVirtualInterrupt, None);
-        output.result()
     }
 
     pub fn initialize(&mut self) {

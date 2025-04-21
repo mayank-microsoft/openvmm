@@ -4,6 +4,8 @@
 #![no_std]
 #![allow(unsafe_code)]
 #![feature(naked_functions)]
+#![feature(abi_x86_interrupt)]
+#![feature(concat_idents)]
 
 #![doc = include_str!("../README.md")]
 // HACK: workaround for building guest_test_uefi as part of the workspace in CI.
