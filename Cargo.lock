@@ -3610,15 +3610,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "linked_list_allocator"
-version = "0.10.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9afa463f5405ee81cdb9cc2baf37e08ec7e4c8209442b5d72c04cfb2cd6e6286"
-dependencies = [
- "spinning_top",
-]
-
-[[package]]
 name = "linkme"
 version = "0.3.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4776,23 +4767,6 @@ dependencies = [
  "openssl",
  "openssl-sys",
  "thiserror 2.0.0",
-]
-
-[[package]]
-name = "opentmk"
-version = "0.0.0"
-dependencies = [
- "arrayvec",
- "bitfield-struct",
- "cfg-if",
- "hvdef",
- "linked_list_allocator",
- "memory_range",
- "minimal_rt",
- "minimal_rt_build",
- "serde_json",
- "uefi",
- "zerocopy 0.8.14",
 ]
 
 [[package]]
@@ -6384,15 +6358,6 @@ dependencies = [
  "thiserror 2.0.0",
  "windows-sys 0.52.0",
  "zerocopy 0.8.14",
-]
-
-[[package]]
-name = "spinning_top"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b9eb1a2f4c41445a3a0ff9abc5221c5fcd28e1f13cd7c0397706f9ac938ddb0"
-dependencies = [
- "lock_api",
 ]
 
 [[package]]

@@ -48,16 +48,3 @@ pub unsafe fn invoke_hypercall(
     }
     output.into()
 }
-
-pub unsafe fn invoke_hypercall_vtl(control: hvdef::hypercall::Control) {
-    // SAFETY: the caller guarantees the safety of this operation.
-    unsafe {
-        core::arch::asm! {
-            "call {hypercall_page}",
-            hypercall_page = sym HYPERCALL_PAGE,
-            inout("rcx") u64::from(control) => _,
-            in("rdx") 0,
-            in("rax") 0,
-        }
-    }
-}

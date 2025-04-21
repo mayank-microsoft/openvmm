@@ -6,7 +6,7 @@
 use core::arch::asm;
 use core::fmt;
 
-const COM3: u16 = 0x2F8;
+const COM3: u16 = 0x3e8;
 
 /// Write a byte to a port.
 ///
