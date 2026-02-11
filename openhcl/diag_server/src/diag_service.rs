@@ -89,6 +89,20 @@ pub enum DiagRequest {
     /// Profile VTL2
     #[cfg(feature = "profiler")]
     Profile(FailableRpc<profiler_worker::ProfilerRequest, ()>),
+    /// Upload dev servicing data (initrd, vmlinux, command line) for a
+    /// developer-driven VTL2 update.
+    DevServicing(FailableRpc<DevServicingData, ()>),
+}
+
+/// Data received from a dev servicing upload.
+#[derive(Debug, mesh::MeshPayload)]
+pub struct DevServicingData {
+    /// The raw initrd image bytes.
+    pub initrd: Vec<u8>,
+    /// The raw vmlinux kernel image bytes.
+    pub vmlinux: Vec<u8>,
+    /// The kernel command line.
+    pub command_line: String,
 }
 
 /// Additional parameters provided as part of a delayed start request.
@@ -247,12 +261,16 @@ impl DiagServiceHandler {
         &self,
         _driver: &(impl Driver + Spawn + Clone),
         req: OpenhclDiag,
-        _ctx: CancelContext,
+        mut ctx: CancelContext,
     ) {
         match req {
             OpenhclDiag::Ping((), response) => {
                 response.send(Ok(()));
             }
+            OpenhclDiag::DevServicing(request, response) => response.send(grpc_result(
+                ctx.until_cancelled(self.handle_dev_servicing(request))
+                    .await,
+            )),
         }
     }
 
@@ -690,6 +708,63 @@ impl DiagServiceHandler {
         } else {
             anyhow::bail!("cannot read directory");
         }
+
+        Ok(())
+    }
+
+    async fn handle_dev_servicing(
+        &self,
+        request: diag_proto::DevServicingRequest,
+    ) -> anyhow::Result<()> {
+        tracing::info!(
+            command_line = %request.command_line,
+            "dev servicing request: receiving initrd and vmlinux"
+        );
+
+        let mut initrd_conn = self
+            .take_connection(request.initrd_conn)
+            .await
+            .context("failed to get initrd data connection")?;
+
+        let mut vmlinux_conn = self
+            .take_connection(request.vmlinux_conn)
+            .await
+            .context("failed to get vmlinux data connection")?;
+
+        // Read both streams to completion into memory buffers.
+        let mut initrd_buf = Vec::new();
+        let mut vmlinux_buf = Vec::new();
+
+        futures::try_join!(
+            async {
+                initrd_conn
+                    .read_to_end(&mut initrd_buf)
+                    .await
+                    .context("failed to read initrd data")
+            },
+            async {
+                vmlinux_conn
+                    .read_to_end(&mut vmlinux_buf)
+                    .await
+                    .context("failed to read vmlinux data")
+            },
+        )?;
+
+        tracing::info!(
+            initrd_size = initrd_buf.len(),
+            vmlinux_size = vmlinux_buf.len(),
+            "dev servicing data received"
+        );
+
+        let data = DevServicingData {
+            initrd: initrd_buf,
+            vmlinux: vmlinux_buf,
+            command_line: request.command_line,
+        };
+
+        self.request_send
+            .call_failable(DiagRequest::DevServicing, data)
+            .await?;
 
         Ok(())
     }

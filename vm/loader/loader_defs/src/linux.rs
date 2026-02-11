@@ -94,7 +94,7 @@ pub struct olpc_ofw_header {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[derive(Debug, Copy, Clone, IntoBytes, Immutable, KnownLayout, FromBytes)]
 pub struct edid_info {
     pub dummy: [u8; 128],
 }
@@ -215,7 +215,7 @@ pub struct ist_info {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[derive(Debug,Copy, Clone, IntoBytes, Immutable, KnownLayout, FromBytes)]
 pub struct boot_params {
     pub screen_info: screen_info,
     pub apm_bios_info: apm_bios_info,

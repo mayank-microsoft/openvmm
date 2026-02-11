@@ -3545,6 +3545,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kexec_sys"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "thiserror 2.0.16",
+ "tracing",
+]
+
+[[package]]
 name = "kmsg"
 version = "0.0.0"
 dependencies = [
@@ -7968,6 +7977,7 @@ dependencies = [
  "disk_blockdevice",
  "disk_get_vmgs",
  "disk_nvme",
+ "fdt",
  "firmware_pcat",
  "firmware_uefi",
  "firmware_uefi_custom_vars",
@@ -7995,6 +8005,7 @@ dependencies = [
  "igvm_defs",
  "input_core",
  "inspect",
+ "kexec_sys",
  "kmsg",
  "kmsg_defs",
  "kmsg_writer",
@@ -8034,6 +8045,7 @@ dependencies = [
  "serde_helpers",
  "serde_json",
  "serial_16550_resources",
+ "sha2",
  "socket2",
  "sparse_mmap",
  "state_unit",

@@ -270,6 +270,19 @@ enum Command {
         #[clap(short)]
         output: Option<PathBuf>,
     },
+    /// Upload dev servicing data (initrd, vmlinux, command line) to the
+    /// running OpenHCL instance for a developer-driven VTL2 update.
+    DevServicing {
+        /// Path to the initrd image file.
+        #[clap(long)]
+        initrd: PathBuf,
+        /// Path to the vmlinux kernel image file.
+        #[clap(long)]
+        vmlinux: PathBuf,
+        /// Kernel command line to use for the new boot.
+        #[clap(long, default_value = "")]
+        command_line: String,
+    },
     /// Starts a network packet capture trace.
     PacketCapture {
         /// Destination file path. nic index is appended to the file name.
@@ -778,6 +791,32 @@ pub fn main() -> anyhow::Result<()> {
                         verbose,
                     )
                     .await?;
+            }
+            Command::DevServicing {
+                initrd,
+                vmlinux,
+                command_line,
+            } => {
+                let client = new_client(driver.clone(), &vm)?;
+                let initrd_file = AllowStdIo::new(
+                    fs_err::File::open(&initrd)
+                        .with_context(|| format!("failed to open initrd: {}", initrd.display()))?,
+                );
+                let vmlinux_file = AllowStdIo::new(
+                    fs_err::File::open(&vmlinux)
+                        .with_context(|| format!("failed to open vmlinux: {}", vmlinux.display()))?,
+                );
+
+                eprintln!(
+                    "Uploading dev servicing data (initrd={}, vmlinux={})...",
+                    initrd.display(),
+                    vmlinux.display()
+                );
+                client
+                    .dev_servicing(initrd_file, vmlinux_file, command_line)
+                    .await?;
+                eprintln!("Dev servicing data upl
+                oaded successfully.");
             }
             Command::Restart => {
                 let client = new_client(driver.clone(), &vm)?;

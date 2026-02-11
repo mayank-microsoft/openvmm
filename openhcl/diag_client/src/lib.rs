@@ -772,6 +772,72 @@ impl DiagClient {
 
         Ok(state.data)
     }
+
+    /// Uploads dev servicing data (initrd, vmlinux, command line) to the
+    /// running OpenHCL instance for a developer-driven VTL2 update.
+    ///
+    /// The initrd and vmlinux are streamed over data connections; the command
+    /// line is sent inline in the RPC message.
+    pub async fn dev_servicing(
+        &self,
+        mut initrd: impl futures::AsyncRead + Unpin,
+        mut vmlinux: impl futures::AsyncRead + Unpin,
+        command_line: String,
+    ) -> anyhow::Result<()> {
+        let (initrd_conn_id, mut initrd_conn) = self
+            .connect_data()
+            .await
+            .context("failed to connect initrd data channel")?;
+
+        let (vmlinux_conn_id, mut vmlinux_conn) = self
+            .connect_data()
+            .await
+            .context("failed to connect vmlinux data channel")?;
+
+        // Stream the file contents over the data connections.
+        let initrd_copy = async {
+            futures::io::copy(&mut initrd, &mut initrd_conn)
+                .await
+                .context("failed to send initrd")?;
+            initrd_conn
+                .close()
+                .await
+                .context("failed to close initrd connection")?;
+            anyhow::Ok(())
+        };
+
+        let vmlinux_copy = async {
+            futures::io::copy(&mut vmlinux, &mut vmlinux_conn)
+                .await
+                .context("failed to send vmlinux")?;
+            vmlinux_conn
+                .close()
+                .await
+                .context("failed to close vmlinux connection")?;
+            anyhow::Ok(())
+        };
+
+        // Send the RPC and stream data concurrently.
+        let rpc_call = async {
+            self.ttrpc
+                .call()
+                .start(
+                    diag_proto::OpenhclDiag::DevServicing,
+                    diag_proto::DevServicingRequest {
+                        initrd_conn: initrd_conn_id,
+                        vmlinux_conn: vmlinux_conn_id,
+                        command_line,
+                    },
+                )
+                .await
+                .map_err(grpc_status)?;
+            anyhow::Ok(())
+        };
+
+        futures::try_join!(initrd_copy, vmlinux_copy, rpc_call)?;
+
+        Ok(())
+    }
 }
 
 fn grpc_status(status: Status) -> anyhow::Error {

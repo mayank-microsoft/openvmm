@@ -97,6 +97,8 @@ underhill_mem.workspace = true
 underhill_threadpool.workspace = true
 openhcl_attestation_protocol.workspace = true
 bootloader_fdt_parser.workspace = true
+fdt.workspace = true
+kexec_sys.workspace = true
 vga_proxy.workspace = true
 video_core.workspace = true
 virt_mshv_vtl.workspace = true
@@ -169,6 +171,7 @@ parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_helpers.workspace = true
 serde_json = { workspace = true, features = ["std"] }
+sha2.workspace = true
 socket2.workspace = true
 thiserror = { workspace = true, features = ["std"] }
 time = { workspace = true, features = ["macros"] }

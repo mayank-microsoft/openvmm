@@ -14,6 +14,9 @@ import "google/protobuf/empty.proto";
 service OpenhclDiag {
     // Ping the server, validating it is ready for use.
     rpc Ping(google.protobuf.Empty) returns (google.protobuf.Empty);
+    // Upload dev servicing data (initrd, vmlinux, command line) for a
+    // developer-driven VTL2 servicing flow.
+    rpc DevServicing(DevServicingRequest) returns (google.protobuf.Empty);
 }
 
 // Older methods.
@@ -105,4 +108,14 @@ message NetworkPacketCaptureResponse {
 
 message CrashRequest {
     int32 pid = 1;
+}
+
+// Request to upload dev servicing data for a developer-driven VTL2 update.
+message DevServicingRequest {
+    // Data connection ID for streaming the initrd image.
+    uint64 initrd_conn = 1;
+    // Data connection ID for streaming the vmlinux kernel image.
+    uint64 vmlinux_conn = 2;
+    // Kernel command line string to use for the new boot.
+    string command_line = 3;
 }
