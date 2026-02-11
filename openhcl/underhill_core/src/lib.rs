@@ -668,68 +668,14 @@ async fn run_control(
                         workers.vm_rpc.send(UhVmRpc::Save(rpc));
                     }
                     diag_server::DiagRequest::DevServicing(rpc) => {
-                        rpc.handle_failable(async |mut data: diag_server::DevServicingData| {
-                            use sha2::Digest;
+                        let Some(workers) = &mut workers else {
+                            rpc.complete(Err(RemoteError::new(anyhow::anyhow!(
+                                "worker has not been started yet"
+                            ))));
+                            continue;
+                        };
 
-                            // If no command line was provided, use the
-                            // currently running kernel's command line.
-                            if data.command_line.is_empty() {
-                                data.command_line = std::fs::read_to_string("/proc/cmdline")
-                                    .context("failed to read /proc/cmdline")?
-                                    .trim_end()
-                                    .to_string();
-                                tracing::info!(
-                                    command_line = %data.command_line,
-                                    "no command line provided, using current kernel cmdline"
-                                );
-                            }
-
-                            let initrd_hash = sha2::Sha256::digest(&data.initrd);
-                            let vmlinux_hash = sha2::Sha256::digest(&data.vmlinux);
-
-                            // Parse the vmlinux/kernel image header to find the entry point.
-                            let vmlinux_info = vmlinux_parser::parse_vmlinux(&data.vmlinux)
-                                .context("failed to parse kernel image")?;
-
-                            tracing::info!(
-                                initrd_size = data.initrd.len(),
-                                initrd_sha256 = %format_args!("{:x}", initrd_hash),
-                                vmlinux_size = data.vmlinux.len(),
-                                vmlinux_sha256 = %format_args!("{:x}", vmlinux_hash),
-                                entry_point = %format_args!("{:#x}", vmlinux_info.entry_point),
-                                arch = %vmlinux_info.arch,
-                                format = %vmlinux_info.format,
-                                command_line = %data.command_line,
-                                "dev servicing data received"
-                            );
-
-                            // Parse the boot device tree to obtain the
-                            // current system's memory map, CPU topology,
-                            // isolation type, and other parameters needed
-                            // to reconstruct the boot environment.
-                            let boot_dt_info = bootloader_fdt_parser::ParsedBootDtInfo::new()
-                                .context("failed to parse boot device tree")?;
-
-                            // Build the kexec segments (kernel, initrd,
-                            // boot_params, FDT, command line).
-                            let (entry_point, segments) =
-                                dev_kexec::prepare_kexec_segments(data, &vmlinux_info, &boot_dt_info)
-                                    .context("failed to prepare kexec segments")?;
-
-                            // Load the segments into the kernel.
-                            kexec_sys::kexec_load(entry_point, &segments)
-                                .context("kexec_load failed")?;
-
-                            tracing::info!("kexec loaded, triggering reboot");
-
-                            // Reboot into the new kernel. On success this
-                            // does not return.
-                            kexec_sys::kexec_reboot()
-                                .context("kexec reboot failed")?;
-
-                            anyhow::Ok(())
-                        })
-                        .await
+                        workers.vm_rpc.send(UhVmRpc::DevServicing(rpc));
                     }
                     #[cfg(feature = "profiler")]
                     diag_server::DiagRequest::Profile(rpc) => {

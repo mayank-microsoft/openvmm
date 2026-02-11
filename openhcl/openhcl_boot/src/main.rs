@@ -508,7 +508,7 @@ mod x86_boot {
 
         boot_params.hdr.setup_data = (setup_data_head as u64).into();
 
-        log::info!("boot_params: {:?}", boot_params);
+        log::debug!("boot_params: {:?}", boot_params);
         boot_params_storage
     }
 }

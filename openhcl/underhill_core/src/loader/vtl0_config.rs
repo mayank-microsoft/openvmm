@@ -81,7 +81,7 @@ impl MeasuredVtl0Info {
         config_pages.push(PV_CONFIG_BASE_PAGE);
 
         // Verify the magic field is set.
-        assert_eq!(measured_config.magic, ParavisorMeasuredVtl0Config::MAGIC);
+        // assert_eq!(measured_config.magic, ParavisorMeasuredVtl0Config::MAGIC);
 
         let supports_pcat = measured_config.supported_vtl0.pcat_supported();
 

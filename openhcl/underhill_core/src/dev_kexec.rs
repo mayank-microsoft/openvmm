@@ -40,6 +40,160 @@ use bootloader_fdt_parser::ParsedBootDtInfo;
 use diag_server::DevServicingData;
 use kexec_sys::KexecSegment;
 
+/// Well-known path where the serialized servicing state is placed inside
+/// the initramfs CPIO overlay. The next boot reads this file to restore
+/// device state after a dev-servicing kexec.
+pub const DEV_SERVICING_STATE_PATH: &str = "/openhcl/dev_servicing_state.bin";
+
+/// Kernel command-line marker appended during dev servicing kexec.
+/// The next boot checks `/proc/cmdline` for this token to distinguish
+/// a dev-servicing restart from a fresh boot.
+pub const DEV_SERVICING_CMDLINE_MARKER: &str = "OPENHCL_SERVICING_COMPLETED=1";
+
+/// Build a minimal CPIO "newc" archive containing a single file at the
+/// given `path` with `contents`.
+///
+/// The returned bytes form a complete CPIO archive (including the
+/// `TRAILER!!!` sentinel) that can be concatenated onto an existing
+/// initramfs/initrd image. The Linux kernel will overlay the contents
+/// when it unpacks the initramfs.
+///
+/// The format follows the SVR4 "newc" (non-CRC) format — magic `070701`,
+/// 110-byte ASCII header, 4-byte aligned name and data fields.
+pub fn build_cpio_archive(path: &str, contents: &[u8]) -> Vec<u8> {
+    fn align4(pos: usize) -> usize {
+        (4 - (pos % 4)) % 4
+    }
+
+    fn write_cpio_entry(
+        buf: &mut Vec<u8>,
+        inode: u32,
+        mode: u32,
+        name: &str,
+        data: &[u8],
+    ) {
+        let namesize = name.len() + 1; // includes NUL
+        let filesize = data.len();
+
+        // 110-byte ASCII header (magic "070701", no CRC).
+        let header = format!(
+            "070701\
+             {inode:08X}\
+             {mode:08X}\
+             00000000\
+             00000000\
+             00000001\
+             00000000\
+             {filesize:08X}\
+             00000000\
+             00000000\
+             00000000\
+             00000000\
+             {namesize:08X}\
+             00000000"
+        );
+        debug_assert_eq!(header.len(), 110);
+
+        buf.extend_from_slice(header.as_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(0); // NUL terminator
+        // Pad name+header to 4-byte boundary.
+        let pad = align4(110 + namesize);
+        buf.extend(std::iter::repeat(0u8).take(pad));
+        // File data.
+        buf.extend_from_slice(data);
+        // Pad data to 4-byte boundary.
+        let pad = align4(filesize);
+        buf.extend(std::iter::repeat(0u8).take(pad));
+    }
+
+    let mut archive = Vec::new();
+
+    // Ensure parent directories exist. Walk the path and emit a
+    // directory entry for every intermediate component.
+    // Strip leading '/' so the CPIO paths are relative.
+    let rel_path = path.strip_prefix('/').unwrap_or(path);
+    let mut inode: u32 = 1;
+
+    // Collect ancestor directories.
+    let parent = std::path::Path::new(rel_path).parent();
+    if let Some(parent) = parent {
+        let mut cumulative = String::new();
+        for component in parent.components() {
+            if !cumulative.is_empty() {
+                cumulative.push('/');
+            }
+            cumulative.push_str(&component.as_os_str().to_string_lossy());
+            // directory: mode 0755 (octal) = 0o040755 (S_IFDIR | 0755)
+            write_cpio_entry(&mut archive, inode, 0o040755, &cumulative, &[]);
+            inode += 1;
+        }
+    }
+
+    // The file entry: mode 0644 (octal) = 0o100644 (S_IFREG | 0644)
+    write_cpio_entry(&mut archive, inode, 0o100644, rel_path, contents);
+
+    // TRAILER!!!
+    write_cpio_entry(&mut archive, 0, 0, "TRAILER!!!", &[]);
+
+    archive
+}
+
+/// Top-level entry point for the dev servicing kexec flow.
+///
+/// Parses the kernel image, computes hashes for diagnostics, reads the
+/// boot device tree, builds the kexec segments, loads them, and triggers
+/// the reboot. On success this function does not return.
+pub fn perform_kexec(mut data: DevServicingData) -> anyhow::Result<()> {
+    // If no command line was provided, use the currently running
+    // kernel's command line.
+    if data.command_line.is_empty() {
+        data.command_line = std::fs::read_to_string("/proc/cmdline")
+            .context("failed to read /proc/cmdline")?
+            .trim_end()
+            .to_string();
+        tracing::debug!(
+            command_line = %data.command_line,
+            "no command line provided, using current kernel cmdline"
+        );
+    }
+
+    // Parse the vmlinux/kernel image header to find the entry point.
+    let vmlinux_info =
+        crate::vmlinux_parser::parse_vmlinux(&data.vmlinux).context("failed to parse kernel image")?;
+
+    tracing::debug!(
+        initrd_size = data.initrd.len(),
+        vmlinux_size = data.vmlinux.len(),
+        entry_point = %format_args!("{:#x}", vmlinux_info.entry_point),
+        arch = %vmlinux_info.arch,
+        format = %vmlinux_info.format,
+        command_line = %data.command_line,
+        "dev servicing: preparing kexec"
+    );
+
+    // Parse the boot device tree to obtain the current system's
+    // memory map, CPU topology, isolation type, and other parameters
+    // needed to reconstruct the boot environment.
+    let boot_dt_info =
+        ParsedBootDtInfo::new().context("failed to parse boot device tree")?;
+
+    // Build the kexec segments (kernel, initrd, boot_params, FDT,
+    // command line).
+    let (entry_point, segments) = prepare_kexec_segments(data, &vmlinux_info, &boot_dt_info)
+        .context("failed to prepare kexec segments")?;
+
+    // Load the segments into the kernel.
+    kexec_sys::kexec_load(entry_point, &segments).context("kexec_load failed")?;
+
+    tracing::debug!("kexec loaded, triggering reboot");
+
+    // Reboot into the new kernel. On success this does not return.
+    kexec_sys::kexec_reboot().context("kexec reboot failed")?;
+
+    Ok(())
+}
+
 /// Size of the device tree buffer. The Linux kernel requires the FDT to fit
 /// within a single 256KB mapping during early boot.
 const FDT_SIZE: usize = 256 * 1024;
@@ -401,8 +555,9 @@ pub fn prepare_kexec_segments(
     if !data.command_line.is_empty() {
         data.command_line.push(' ');
     }
+    data.command_line.push(' ');
     data.command_line
-        .push_str(" OPENHCL_SERVICING_COMPLETED=1");
+        .push_str(DEV_SERVICING_CMDLINE_MARKER);
 
     // Enable early console output on COM3 (I/O 0x3E8 = ttyS2) so that
     // kernel boot messages are visible via the Hyper-V COM3 pipe /
@@ -575,7 +730,7 @@ fn prepare_x86_64(
     )
     .context("failed to build boot_params")?;
 
-    tracing::info!(boot_params = ?bp, "built boot_params with e820 map entries:");
+    tracing::debug!(boot_params = ?bp, "built boot_params with e820 map entries:");
 
     let boot_params_buf = bp.as_bytes().to_vec();
 

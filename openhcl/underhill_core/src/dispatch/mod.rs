@@ -83,6 +83,9 @@ pub enum UhVmRpc {
     Save(FailableRpc<(), Vec<u8>>),
     ClearHalt(Rpc<(), bool>), // TODO: remove this, and use DebugRequest::Resume
     PacketCapture(FailableRpc<PacketCaptureParams<Socket>, PacketCaptureParams<Socket>>),
+    /// Developer-driven VTL2 servicing: stop VPs, save device state,
+    /// shut down devices, and kexec into a new kernel.
+    DevServicing(FailableRpc<diag_server::DevServicingData, ()>),
 }
 
 #[async_trait]
@@ -401,6 +404,12 @@ impl LoadedVm {
                         })
                         .await
                     }
+                    UhVmRpc::DevServicing(rpc) => {
+                        rpc.handle_failable(async |data| {
+                            self.handle_dev_servicing(data).await
+                        })
+                        .await
+                    }
                 },
                 Event::ServicingRequest(message) => {
                     // Explicitly destructure the message for easier tracking of its changes.
@@ -710,6 +719,123 @@ impl LoadedVm {
         });
 
         Ok(state)
+    }
+
+    /// Handle a developer-driven VTL2 servicing request.
+    ///
+    /// This mirrors the normal servicing flow: stop VPs, save device
+    /// state, shut down devices (network/NVMe/PCI), and then kexec
+    /// into the new kernel.
+    async fn handle_dev_servicing(
+        &mut self,
+        mut data: diag_server::DevServicingData,
+    ) -> anyhow::Result<()> {
+        // 1. Stop all VPs / state units.
+        let was_running = self.stop().await;
+        tracing::debug!(was_running, "dev servicing: VPs stopped");
+
+        // 2. Save all device state (same as normal servicing).
+        let save_result = self
+            .save(None, KeepAliveConfig::Disabled, KeepAliveConfig::Disabled)
+            .await;
+
+        let saved_state = match save_result {
+            Ok(state) => {
+                tracing::debug!("dev servicing: device state saved successfully");
+                state
+            }
+            Err(err) => {
+                tracing::error!(
+                    error = err.as_ref() as &dyn std::error::Error,
+                    "dev servicing: device state save failed, attempting recovery"
+                );
+                // Try to resume the VM so we don't leave it in a broken state.
+                if was_running {
+                    self.start(None).await;
+                }
+                return Err(err);
+            }
+        };
+
+        // 3. Write persisted state for the boot shim, same as normal
+        //    servicing. Without this the next openhcl_boot invocation
+        //    won't have the correct memory map / interrupt state.
+        let nvme_vp_interrupt_state =
+            crate::nvme_manager::save_restore_helpers::nvme_interrupt_state(
+                saved_state.init_state.nvme_state.as_ref().map(|n| &n.nvme_state),
+            );
+        crate::loader::vtl2_config::write_persisted_info(
+            self.runtime_params.parsed_openhcl_boot(),
+            nvme_vp_interrupt_state,
+        )
+        .context("failed to write persisted info for dev servicing")?;
+
+        // 4. Shut down devices: network (MANA), NVMe, and PCI —
+        //    same teardown as normal servicing, but without keepalive.
+        //    Note: vmbus_client is already stopped and saved inside
+        //    self.save() — do NOT call vmbus_client.stop() again here.
+        let shutdown_mana = async {
+            if let Some(network_settings) = self.network_settings.as_mut() {
+                network_settings
+                    .unload_for_servicing()
+                    .instrument(tracing::info_span!("dev_servicing_shutdown_mana"))
+                    .await;
+            }
+        };
+
+        let shutdown_nvme = async {
+            if let Some(nvme_manager) = self.nvme_manager.take() {
+                nvme_manager
+                    .shutdown(false /* no keepalive */)
+                    .instrument(tracing::info_span!("dev_servicing_shutdown_nvme"))
+                    .await;
+            }
+        };
+
+        let shutdown_pci = async {
+            pci_shutdown::shutdown_pci_devices()
+                .instrument(tracing::info_span!("dev_servicing_shutdown_pci"))
+                .await
+        };
+
+        let (pci_result, (), ()) = (shutdown_pci, shutdown_mana, shutdown_nvme).join().await;
+        pci_result.context("failed to shut down PCI devices during dev servicing")?;
+
+        tracing::debug!("dev servicing: all devices shut down, proceeding to kexec");
+
+        // 5. Serialize the saved state and append it to the initrd as a
+        //    CPIO overlay so the next kernel can read it at a known path.
+        let state_bytes = mesh::payload::encode(saved_state);
+        tracing::debug!(
+            state_size = state_bytes.len(),
+            "dev servicing: serialized servicing state"
+        );
+
+        let cpio_archive = crate::dev_kexec::build_cpio_archive(
+            crate::dev_kexec::DEV_SERVICING_STATE_PATH,
+            &state_bytes,
+        );
+        tracing::debug!(
+            cpio_size = cpio_archive.len(),
+            path = crate::dev_kexec::DEV_SERVICING_STATE_PATH,
+            "dev servicing: built CPIO archive for servicing state"
+        );
+
+        // The Linux kernel supports concatenated initramfs archives
+        // where each segment can be independently compressed or
+        // uncompressed. After the gzip decompressor finishes the
+        // first archive, unpack_to_rootfs() scans the remaining
+        // bytes for the next archive. Pad to a 4-byte boundary so
+        // the kernel finds the raw CPIO "070701" magic cleanly.
+        let pad = (4 - (data.initrd.len() % 4)) % 4;
+        data.initrd.extend(std::iter::repeat(0u8).take(pad));
+        data.initrd.extend_from_slice(&cpio_archive);
+
+        // 6. Perform the kexec into the new kernel.
+        crate::dev_kexec::perform_kexec(data)
+            .context("kexec failed during dev servicing")?;
+
+        Ok(())
     }
 
     async fn handle_hibernate_request(&self) {
