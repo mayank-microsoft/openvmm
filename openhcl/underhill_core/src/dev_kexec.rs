@@ -736,6 +736,15 @@ fn prepare_x86_64(
         );
     }
 
+    // Compute the kernel physical load base (lowest relocated segment address).
+    // This is needed for boot_params.hdr.pref_address and init_size so the
+    // new kernel reserves this memory and does not overwrite its own code.
+    let kernel_load_phys = kernel_segments
+        .iter()
+        .map(|s| s.phys_addr)
+        .min()
+        .unwrap();
+
     // Place auxiliary segments after the kernel's highest segment.
     let mut next_addr = align_up(highest_seg_end, PAGE_SIZE);
 
@@ -799,6 +808,8 @@ fn prepare_x86_64(
 
     // -- 3. Build boot_params (zero page) ------------------------------------
     let bp = build_boot_params(
+        kernel_load_phys,
+        next_addr,
         initrd_phys..initrd_phys + initrd_size,
         cmdline_phys,
         fdt_phys,
@@ -864,6 +875,8 @@ fn prepare_x86_64(
 /// Construct `boot_params` (zero page) mimicking `openhcl_boot`.
 #[cfg(target_arch = "x86_64")]
 fn build_boot_params(
+    kernel_load_phys: u64,
+    segments_end_phys: u64,
     initrd: std::ops::Range<u64>,
     cmdline_phys: u64,
     setup_data_phys: u64,
@@ -891,6 +904,20 @@ fn build_boot_params(
 
     bp.hdr.setup_data = setup_data_phys.into();
 
+    // Tell the kernel where it is loaded and how much memory to reserve.
+    // init_size covers all kexec segments (kernel text, initrd, FDT, etc.)
+    // from the kernel load address to the end. Without this, the kernel's
+    // early memory allocator may overwrite its own code pages.
+    bp.hdr.pref_address = kernel_load_phys.into();
+    let init_size = (segments_end_phys - kernel_load_phys) as u32;
+    bp.hdr.init_size = init_size.into();
+    bp.hdr.relocatable_kernel = 1;
+    bp.hdr.kernel_alignment = (2 * 1024 * 1024_u32).into(); // 2 MB
+    tracing::info!(
+        pref_address = %format_args!("{:#x}", kernel_load_phys),
+        init_size = %format_args!("{:#x}", init_size),
+        "boot_params: kernel load reservation"
+    );
     build_e820_map(&mut bp)?;
 
     Ok(bp)
