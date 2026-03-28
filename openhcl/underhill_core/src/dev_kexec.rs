@@ -586,7 +586,7 @@ pub fn prepare_kexec_segments(
 fn prepare_x86_64(
     data: DevServicingData,
     vmlinux_info: &VmlinuxInfo,
-    boot_dt_info: &ParsedBootDtInfo,
+    _boot_dt_info: &ParsedBootDtInfo,
 ) -> anyhow::Result<(u64, Vec<KexecSegment>)> {
     use loader_defs::linux::SETUP_DTB;
     use loader_defs::linux::setup_data;
@@ -621,16 +621,19 @@ fn prepare_x86_64(
     // corrupt guest memory. Detect this case and rebase all segments
     // into the VTL2 RAM range, aligned to PHYSICAL_ALIGN (2 MB).
 
-    let largest_ram = boot_dt_info
-        .vtl2_memory
-        .iter()
-        .max_by_key(|r| r.range.len())
-        .context("no VTL2 memory ranges available")?;
+    // Use the actual System RAM ranges from /proc/iomem rather than the
+    // device-tree VTL2 range. The DT range may include a small reserved
+    // region at the base that is not marked as System RAM in the e820 map.
+    // Placing the kernel there causes the new kernel to remove its own
+    // .text from the memory map ("not marked as E820_TYPE_RAM!").
+    let usable_ram = find_largest_system_ram()
+        .context("finding System RAM for kexec placement")?;
 
     tracing::info!(
-        range_start = %format_args!("{:#x}", largest_ram.range.start()),
-        range_len = %format_args!("{:#x}", largest_ram.range.len()),
-        "using VTL2 RAM range for kexec segment placement"
+        range_start = %format_args!("{:#x}", usable_ram.start),
+        range_end = %format_args!("{:#x}", usable_ram.end),
+        range_len = %format_args!("{:#x}", usable_ram.end - usable_ram.start),
+        "using System RAM range from /proc/iomem for kexec segment placement"
     );
 
     // Compute relocation delta if kernel segments fall outside VTL2 RAM.
@@ -648,17 +651,17 @@ fn prepare_x86_64(
         .min()
         .unwrap(); // safe: ensured non-empty above
 
-    let reloc_delta: i64 = if lowest_seg_paddr < largest_ram.range.start()
+    let reloc_delta: i64 = if lowest_seg_paddr < usable_ram.start
         || vmlinux_info.segments.iter().any(|s| {
-            s.paddr + align_up(s.mem_size, PAGE_SIZE) > largest_ram.range.end()
+            s.paddr + align_up(s.mem_size, PAGE_SIZE) > usable_ram.end
         })
     {
         // Segments fall outside VTL2 RAM — relocate into the range.
-        let new_base = align_up(largest_ram.range.start(), PHYSICAL_ALIGN);
+        let new_base = align_up(usable_ram.start, PHYSICAL_ALIGN);
         let delta = new_base as i64 - lowest_seg_paddr as i64;
         tracing::warn!(
             lowest_seg_paddr = %format_args!("{:#x}", lowest_seg_paddr),
-            vtl2_range_start = %format_args!("{:#x}", largest_ram.range.start()),
+            vtl2_range_start = %format_args!("{:#x}", usable_ram.start),
             new_base = %format_args!("{:#x}", new_base),
             delta = %format_args!("{:#x}", delta),
             "kernel segments outside VTL2 RAM, relocating"
@@ -727,12 +730,12 @@ fn prepare_x86_64(
     for kseg in &kernel_segments {
         let seg_end = kseg.phys_addr + kseg.mem_size as u64;
         anyhow::ensure!(
-            kseg.phys_addr >= largest_ram.range.start() && seg_end <= largest_ram.range.end(),
+            kseg.phys_addr >= usable_ram.start && seg_end <= usable_ram.end,
             "relocated kernel segment [{:#x}..{:#x}) outside VTL2 RAM [{:#x}..{:#x})",
             kseg.phys_addr,
             seg_end,
-            largest_ram.range.start(),
-            largest_ram.range.end()
+            usable_ram.start,
+            usable_ram.end
         );
     }
 
@@ -778,10 +781,10 @@ fn prepare_x86_64(
 
     // Verify everything fits in the RAM range.
     anyhow::ensure!(
-        next_addr <= largest_ram.range.end(),
+        next_addr <= usable_ram.end,
         "kexec segments ({:#x} bytes) exceed VTL2 RAM range (ends at {:#x})",
-        next_addr - largest_ram.range.start(),
-        largest_ram.range.end()
+        next_addr - usable_ram.start,
+        usable_ram.end
     );
 
     // -- 2. Build the device tree --------------------------------------------
@@ -924,6 +927,49 @@ fn build_boot_params(
 }
 
 /// Build the e820 memory map by parsing `/proc/iomem`.
+
+/// Find the largest contiguous "System RAM" range from `/proc/iomem`.
+///
+/// The kernel's e820 map is built from `/proc/iomem`, and the kexec'd
+/// kernel will reject pages that are not marked as `E820_TYPE_RAM`.
+/// The device-tree VTL2 range may start earlier than the first System RAM
+/// entry (e.g. firmware reserves a small region at the base), so we must
+/// place kexec segments within an actual System RAM range to avoid the
+/// kernel removing its own `.text` from the memory map.
+#[cfg(target_arch = "x86_64")]
+fn find_largest_system_ram() -> anyhow::Result<std::ops::Range<u64>> {
+    let iomem = std::fs::read_to_string("/proc/iomem")
+        .context("failed to read /proc/iomem for System RAM discovery")?;
+
+    let mut best: Option<std::ops::Range<u64>> = None;
+
+    for line in iomem.lines() {
+        // Only top-level entries (non-indented).
+        if line.starts_with(' ') || line.starts_with('\t') {
+            continue;
+        }
+        let Some((range_part, desc_part)) = line.split_once(" : ") else {
+            continue;
+        };
+        if desc_part.trim() != "System RAM" {
+            continue;
+        }
+        let Some((start_hex, end_hex)) = range_part.trim().split_once('-') else {
+            continue;
+        };
+        let start = u64::from_str_radix(start_hex.trim(), 16)
+            .with_context(|| format!("bad iomem start {:?}", start_hex))?;
+        let end = u64::from_str_radix(end_hex.trim(), 16)
+            .with_context(|| format!("bad iomem end {:?}", end_hex))?;
+        let size = end.saturating_sub(start).saturating_add(1);
+
+        if best.as_ref().map_or(true, |b| size > (b.end - b.start)) {
+            best = Some(start..end + 1);
+        }
+    }
+
+    best.context("no System RAM found in /proc/iomem")
+}
 ///
 /// `/proc/iomem` is always available and reflects the kernel's view of the
 /// physical address space. Only top-level (non-indented) entries are used,
@@ -1033,19 +1079,22 @@ fn prepare_aarch64(
 ) -> anyhow::Result<(u64, Vec<KexecSegment>)> {
     let entry_point = vmlinux_info.entry_point;
 
-    let largest_ram = boot_dt_info
-        .vtl2_memory
-        .iter()
-        .max_by_key(|r| r.range.len())
-        .context("no VTL2 memory ranges available")?;
+    // Use the actual System RAM ranges from /proc/iomem rather than the
+    // device-tree VTL2 range. The DT range may include a small reserved
+    // region at the base that is not marked as System RAM in the e820 map.
+    // Placing the kernel there causes the new kernel to remove its own
+    // .text from the memory map ("not marked as E820_TYPE_RAM!").
+    let usable_ram = find_largest_system_ram()
+        .context("finding System RAM for kexec placement")?;
 
     tracing::info!(
-        range_start = %format_args!("{:#x}", largest_ram.range.start()),
-        range_len = %format_args!("{:#x}", largest_ram.range.len()),
-        "using VTL2 RAM range for kexec segment placement"
+        range_start = %format_args!("{:#x}", usable_ram.start),
+        range_end = %format_args!("{:#x}", usable_ram.end),
+        range_len = %format_args!("{:#x}", usable_ram.end - usable_ram.start),
+        "using System RAM range from /proc/iomem for kexec segment placement"
     );
 
-    let mut next_addr = align_up(largest_ram.range.start() + 2 * 1024 * 1024, PAGE_SIZE);
+    let mut next_addr = align_up(usable_ram.start + 2 * 1024 * 1024, PAGE_SIZE);
 
     // Trampoline (placed first; its address becomes the kexec entry point)
     let trampoline_phys = next_addr;
@@ -1077,10 +1126,10 @@ fn prepare_aarch64(
 
     // Verify everything fits.
     anyhow::ensure!(
-        next_addr <= largest_ram.range.end(),
+        next_addr <= usable_ram.end,
         "kexec segments ({:#x} bytes) exceed VTL2 RAM range (ends at {:#x})",
-        next_addr - largest_ram.range.start(),
-        largest_ram.range.end()
+        next_addr - usable_ram.start,
+        usable_ram.end
     );
 
     // Clone the boot device tree, patching the /chosen node with the
