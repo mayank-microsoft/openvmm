@@ -654,9 +654,13 @@ fn prepare_x86_64(
         "ELF vmlinux has no PT_LOAD segments"
     );
 
-    // OpenHCL runs identity-mapped (vaddr == paddr), so e_entry is already
-    // the physical entry point.
-    let kernel_entry_phys = vmlinux_info.entry_point;
+    // Compute the kernel blob layout from ELF segments.
+    let lowest_paddr = vmlinux_info
+        .segments
+        .iter()
+        .map(|s| s.paddr)
+        .min()
+        .unwrap();
 
     for seg in &vmlinux_info.segments {
         tracing::info!(
@@ -676,34 +680,30 @@ fn prepare_x86_64(
     // (trampoline, initrd, FDT, boot_params, cmdline) are placed after
     // the highest ELF segment in the largest VTL2 RAM range.
 
-    let largest_ram = boot_dt_info
-        .vtl2_memory
-        .iter()
-        .max_by_key(|r| r.range.len())
-        .context("no VTL2 memory ranges available")?;
+    // Find the largest System RAM range from /proc/iomem for segment placement.
+    let largest_ram = find_largest_system_ram()
+        .context("failed to find System RAM in /proc/iomem")?;
 
     tracing::info!(
-        range_start = %format_args!("{:#x}", largest_ram.range.start()),
-        range_len = %format_args!("{:#x}", largest_ram.range.len()),
-        "using VTL2 RAM range for kexec segment placement"
+        range_start = %format_args!("{:#x}", largest_ram.0),
+        range_end = %format_args!("{:#x}", largest_ram.1),
+        range_len = %format_args!("{:#x}", largest_ram.1 - largest_ram.0),
+        "using System RAM range from /proc/iomem for kexec segment placement"
     );
 
     // Build a single contiguous kernel blob covering all ELF PT_LOAD segments.
-    // Each segment's file data is placed at (seg.paddr - lowest_paddr) within
-    // the blob, with gaps and BSS regions zero-filled.
-    let lowest_paddr = vmlinux_info
-        .segments
-        .iter()
-        .map(|s| s.paddr)
-        .min()
-        .unwrap();
-    let highest_seg_end = vmlinux_info
+    let highest_seg_end_elf = vmlinux_info
         .segments
         .iter()
         .map(|s| s.paddr + align_up(s.mem_size, PAGE_SIZE))
         .max()
         .unwrap();
-    let kernel_blob_size = align_up(highest_seg_end - lowest_paddr, PAGE_SIZE) as usize;
+    let kernel_blob_size = align_up(highest_seg_end_elf - lowest_paddr, PAGE_SIZE) as usize;
+
+    // Place the kernel at the start of the largest System RAM range,
+    // aligned to 2MB (kernel_alignment).
+    let kernel_load_phys = align_up(largest_ram.0, 0x200000);
+    let kernel_entry_phys = kernel_load_phys + (vmlinux_info.entry_point - lowest_paddr);
 
     let mut kernel_blob = vec![0u8; kernel_blob_size];
     for seg in &vmlinux_info.segments {
@@ -723,13 +723,14 @@ fn prepare_x86_64(
     }
 
     tracing::info!(
-        kernel_load_phys = %format_args!("{:#x}", lowest_paddr),
+        kernel_load_phys = %format_args!("{:#x}", kernel_load_phys),
+        kernel_entry_phys = %format_args!("{:#x}", kernel_entry_phys),
         kernel_blob_size = %format_args!("{:#x}", kernel_blob_size),
         "loading vmlinux as single contiguous blob"
     );
 
-    // Place auxiliary segments after the kernel blob.
-    let mut next_addr = align_up(highest_seg_end, PAGE_SIZE);
+    // Place auxiliary segments after the relocated kernel blob.
+    let mut next_addr = align_up(kernel_load_phys + kernel_blob_size as u64, PAGE_SIZE);
 
     // Trampoline
     let trampoline_phys = next_addr;
@@ -774,10 +775,10 @@ fn prepare_x86_64(
 
     // Verify everything fits in the RAM range.
     anyhow::ensure!(
-        next_addr <= largest_ram.range.end(),
-        "kexec segments ({:#x} bytes) exceed VTL2 RAM range (ends at {:#x})",
-        next_addr - largest_ram.range.start(),
-        largest_ram.range.end()
+        next_addr <= largest_ram.1,
+        "kexec segments ({:#x} bytes) exceed System RAM range (ends at {:#x})",
+        next_addr - largest_ram.0,
+        largest_ram.1
     );
 
     // -- 2. Build the device tree --------------------------------------------
@@ -802,10 +803,13 @@ fn prepare_x86_64(
     let fdt_buf = fdt.as_bytes().to_vec();
 
     // -- 3. Build boot_params (zero page) ------------------------------------
+    let kernel_init_size = align_up(kernel_blob_size as u64, 0x200000);
     let bp = build_boot_params(
         initrd_phys..initrd_phys + initrd_size,
         cmdline_phys,
         fdt_phys,
+        kernel_load_phys,
+        kernel_init_size,
     )
     .context("failed to build boot_params")?;
 
@@ -840,10 +844,10 @@ fn prepare_x86_64(
         mem_size: trampoline_memsz,
     }];
 
-    // Add the single kernel blob.
+    // Add the single kernel blob at the relocated address.
     segments.push(KexecSegment {
         data: kernel_blob,
-        phys_addr: lowest_paddr,
+        phys_addr: kernel_load_phys,
         mem_size: kernel_blob_size,
     });
 
@@ -883,6 +887,8 @@ fn build_boot_params(
     initrd: std::ops::Range<u64>,
     cmdline_phys: u64,
     setup_data_phys: u64,
+    kernel_load_phys: u64,
+    kernel_init_size: u64,
 ) -> anyhow::Result<loader_defs::linux::boot_params> {
     use loader_defs::linux::boot_params;
     use zerocopy::FromZeros;
@@ -907,9 +913,46 @@ fn build_boot_params(
 
     bp.hdr.setup_data = setup_data_phys.into();
 
+    // Tell the kernel where it was loaded and how much space it needs.
+    bp.hdr.pref_address = kernel_load_phys.into();
+    bp.hdr.init_size = (kernel_init_size as u32).into();
+    bp.hdr.relocatable_kernel = 1;
+    bp.hdr.kernel_alignment = 0x200000u32.into(); // 2MB
+
     build_e820_map(&mut bp)?;
 
     Ok(bp)
+}
+
+/// Find the largest "System RAM" range from `/proc/iomem`.
+/// Returns `(start, end)` where end is exclusive.
+#[cfg(target_arch = "x86_64")]
+fn find_largest_system_ram() -> anyhow::Result<(u64, u64)> {
+    let content = std::fs::read_to_string("/proc/iomem")
+        .context("failed to read /proc/iomem")?;
+
+    let mut best: Option<(u64, u64)> = None;
+
+    for line in content.lines() {
+        // Only top-level entries (no leading whitespace).
+        if line.starts_with(' ') || line.starts_with('\t') {
+            continue;
+        }
+        if !line.contains("System RAM") {
+            continue;
+        }
+        // Parse "<start>-<end> : System RAM"
+        let addr_part = line.split(':').next().unwrap_or("").trim();
+        let mut parts = addr_part.split('-');
+        let start = u64::from_str_radix(parts.next().unwrap_or("").trim(), 16).unwrap_or(0);
+        let end = u64::from_str_radix(parts.next().unwrap_or("").trim(), 16).unwrap_or(0) + 1;
+        let len = end.saturating_sub(start);
+        if len > best.map_or(0, |(s, e)| e - s) {
+            best = Some((start, end));
+        }
+    }
+
+    best.context("no System RAM found in /proc/iomem")
 }
 
 /// Build the e820 memory map by parsing `/proc/iomem`.
