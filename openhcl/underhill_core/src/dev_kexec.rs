@@ -634,10 +634,12 @@ fn prepare_x86_64(
     // Start at a 2 MB-aligned address within the RAM range.
     let kernel_load_phys = align_up(usable_ram.start, PHYSICAL_ALIGN);
 
-    // Place each ELF PT_LOAD segment preserving the relative offsets from
-    // the original ELF layout. The kernel's virtual address mapping and
-    // self-relocation logic depend on the inter-segment distances being
-    // maintained exactly as they appear in the ELF.
+    // Build a single contiguous kernel image buffer covering the entire
+    // physical range from the first to the last ELF segment. Each
+    // PT_LOAD segment's data is placed at its correct offset within
+    // the buffer (paddr - lowest_paddr). Gaps between segments are
+    // zero-filled. This avoids multi-segment kexec complexity and
+    // ensures the kernel's inter-segment layout is perfectly preserved.
     let lowest_seg_paddr = vmlinux_info
         .segments
         .iter()
@@ -645,12 +647,17 @@ fn prepare_x86_64(
         .min()
         .unwrap();
 
-    let mut kernel_segments = Vec::new();
-    let mut highest_seg_end: u64 = 0;
-    for seg in &vmlinux_info.segments {
-        let seg_memsz = align_up(seg.mem_size, PAGE_SIZE) as usize;
+    let highest_seg_end = vmlinux_info
+        .segments
+        .iter()
+        .map(|s| s.paddr + align_up(s.mem_size, PAGE_SIZE))
+        .max()
+        .unwrap();
 
-        // Extract the segment data from the raw ELF file.
+    let kernel_image_size = align_up(highest_seg_end - lowest_seg_paddr, PAGE_SIZE) as usize;
+    let mut kernel_buf = vec![0u8; kernel_image_size];
+
+    for seg in &vmlinux_info.segments {
         let file_start = seg.file_offset as usize;
         let file_end = file_start + seg.file_size as usize;
         anyhow::ensure!(
@@ -661,34 +668,28 @@ fn prepare_x86_64(
             data.vmlinux.len()
         );
 
-        // Build the segment data: file contents + zero-fill for BSS.
-        let mut seg_data = data.vmlinux[file_start..file_end].to_vec();
-        if seg.mem_size > seg.file_size {
-            seg_data.resize(seg.mem_size as usize, 0);
-        }
-
-        // Preserve relative offset from the lowest segment.
-        let seg_phys = kernel_load_phys + (seg.paddr - lowest_seg_paddr);
-        let seg_end = seg_phys + seg_memsz as u64;
-        if seg_end > highest_seg_end {
-            highest_seg_end = seg_end;
-        }
+        // Place segment data at its offset within the flat image.
+        let buf_offset = (seg.paddr - lowest_seg_paddr) as usize;
+        kernel_buf[buf_offset..buf_offset + seg.file_size as usize]
+            .copy_from_slice(&data.vmlinux[file_start..file_end]);
+        // BSS (mem_size > file_size) is already zero from vec![0u8; ...].
 
         tracing::info!(
             original_paddr = %format_args!("{:#x}", seg.paddr),
-            placed_at = %format_args!("{:#x}", seg_phys),
-            mem_size = %format_args!("{:#x}", seg_memsz),
-            "placed ELF segment"
+            placed_at = %format_args!("{:#x}", kernel_load_phys + buf_offset as u64),
+            file_size = %format_args!("{:#x}", seg.file_size),
+            mem_size = %format_args!("{:#x}", seg.mem_size),
+            "placed ELF segment into flat kernel image"
         );
-
-        kernel_segments.push(KexecSegment {
-            data: seg_data,
-            phys_addr: seg_phys,
-            mem_size: seg_memsz,
-        });
     }
 
-    let mut next_addr = align_up(highest_seg_end, PAGE_SIZE);
+    tracing::info!(
+        kernel_load_phys = %format_args!("{:#x}", kernel_load_phys),
+        kernel_image_size = %format_args!("{:#x}", kernel_image_size),
+        "built flat kernel image"
+    );
+
+    let mut next_addr = kernel_load_phys + kernel_image_size as u64;
 
     let kernel_entry_phys = kernel_load_phys + (vmlinux_info.entry_point - lowest_seg_paddr);
     tracing::info!(
@@ -789,7 +790,12 @@ fn prepare_x86_64(
         mem_size: trampoline_memsz,
     }];
 
-    segments.extend(kernel_segments);
+    // Single contiguous kernel image segment.
+    segments.push(KexecSegment {
+        data: kernel_buf,
+        phys_addr: kernel_load_phys,
+        mem_size: kernel_image_size,
+    });
 
     segments.push(KexecSegment {
         data: data.initrd,
