@@ -596,6 +596,54 @@ fn build_x86_64_trampoline(boot_params_phys: u64, kernel_entry: u64, page_table_
     code.push(0xB8);
     code.extend_from_slice(&kernel_entry.to_le_bytes());
 
+    // Verify kernel code is at entry address by reading first byte
+    // and printing its hex value. Expected: 0x49 (first byte of mov %rsi,%r15)
+    //   movabs rbx, <kernel_entry>  =>  48 BB <imm64>
+    code.push(0x48);
+    code.push(0xBB);
+    code.extend_from_slice(&kernel_entry.to_le_bytes());
+    //   movzx ecx, byte [rbx]  =>  0F B6 0B
+    code.extend_from_slice(&[0x0F, 0xB6, 0x0B]);
+    // Print hex nibbles of CL
+    // High nibble: shr ecx copy to edx, then convert
+    //   mov edx, ecx  =>  89 CA
+    code.extend_from_slice(&[0x89, 0xCA]);
+    //   shr edx, 4  =>  C1 EA 04
+    code.extend_from_slice(&[0xC1, 0xEA, 0x04]);
+    //   and edx, 0xF  =>  83 E2 0F
+    code.extend_from_slice(&[0x83, 0xE2, 0x0F]);
+    //   add edx, 0x30  =>  83 C2 30
+    code.extend_from_slice(&[0x83, 0xC2, 0x30]);
+    //   cmp edx, 0x3A  =>  83 FA 3A
+    code.extend_from_slice(&[0x83, 0xFA, 0x3A]);
+    //   jb .h1  =>  72 02
+    code.extend_from_slice(&[0x72, 0x02]);
+    //   add edx, 7  =>  83 C2 07  ('A'-'9'-1)
+    code.extend_from_slice(&[0x83, 0xC2, 0x07]);
+    // .h1: write DL to COM3
+    //   mov dx has been clobbered, but we need to write to COM3
+    //   Save hex char in r8
+    //   Actually simpler: just print '4' if high nibble is 4, '9' if 0x49
+    // Let me use a different approach - just emit the raw byte value
+    // Print 'V' then the byte. If byte is 0x49 = 'I' in some sense
+    // Simplest: just check if byte == 0x49 and print Y or N
+    //   cmp cl, 0x49  =>  80 F9 49
+    code.extend_from_slice(&[0x80, 0xF9, 0x49]);
+    //   je .yes  =>  74 XX
+    let je_pos = code.len();
+    code.extend_from_slice(&[0x74, 0x00]); // placeholder
+    emit_serial_char(&mut code, b'N'); // byte NOT 0x49
+    //   jmp .done  =>  EB XX
+    let jmp_pos = code.len();
+    code.extend_from_slice(&[0xEB, 0x00]); // placeholder
+    // .yes:
+    let yes_pos = code.len();
+    code[je_pos + 1] = (yes_pos - je_pos - 2) as u8;
+    emit_serial_char(&mut code, b'Y'); // byte IS 0x49
+    // .done:
+    let done_pos = code.len();
+    code[jmp_pos + 1] = (done_pos - jmp_pos - 2) as u8;
+
     emit_serial_char(&mut code, b'J'); // about to jump to kernel
 
     // jmp rax  =>  FF E0
