@@ -455,21 +455,96 @@ fn build_x86_64_trampoline(boot_params_phys: u64, kernel_entry: u64, page_table_
     //   mov dr7, rax  =>  0F 23 F8   (disable all breakpoints)
     code.extend_from_slice(&[0x0F, 0x23, 0xF8]);
 
-    // Null out data segment selectors. In 64-bit long mode null selectors
-    // are valid for DS/ES/SS/FS/GS. The kernel will load its own GDT and
-    // selectors during early init.
+    // --- Load a GDT per the 64-bit boot protocol ---
+    // The kernel expects __BOOT_CS (0x10) and __BOOT_DS (0x18) in the GDT.
+    // We place the GDT data at offset 0xF00 within this page (well past
+    // the code) and reference it via the trampoline's physical address.
+    //
+    // GDT layout (4 entries × 8 bytes = 32 bytes):
+    //   [0x00] null descriptor
+    //   [0x08] unused (padding so __BOOT_CS = 0x10)
+    //   [0x10] __BOOT_CS: 64-bit code, execute/read, DPL 0
+    //   [0x18] __BOOT_DS: data, read/write, DPL 0
+    //
+    // GDT descriptor (10 bytes): 2-byte limit + 8-byte base address
+
+    // Compute GDT base = trampoline_phys + 0xF00 (filled in at end of fn)
+    // We store the LGDT descriptor at offset 0xEF0 (6 bytes: 2 limit + 4 base)
+    // Actually, we'll use a RIP-relative approach: compute GDT address
+    // from the page_table_phys we already have in a register... NO, simpler
+    // to just embed the absolute address.
+
+    // movabs rax, <trampoline_phys + 0xF00>  (GDT base)
+    //   48 B8 <imm64>
+    // We don't have trampoline_phys here yet... but we do have page_table_phys.
+    // Actually, the GDT address is embedded later. Let's use lea rax, [rip + offset].
+    // We know the GDT is at a fixed offset from the current code position.
+    // But the offset depends on how many bytes of code precede this.
+    //
+    // Simpler approach: just embed the GDT descriptor inline and use
+    // lea to get its address via RIP-relative.
+
+    // lea rax, [rip + gdt_data_offset]  -- we'll compute offset below
+    // For now, emit a placeholder and patch it.
+    let _lgdt_fixup_pos = code.len();
+
+    // lgdt [rip + offset] approach:
+    // sub rsp, 16 => 48 83 EC 10  (make stack space for GDT descriptor)
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x10]);
+
+    // mov word [rsp], 31  => 66 C7 04 24 1F 00  (GDT limit = 4*8-1 = 31)
+    code.extend_from_slice(&[0x66, 0xC7, 0x04, 0x24, 0x1F, 0x00]);
+
+    // lea rax, [rip + <offset_to_gdt>]  => 48 8D 05 XX XX XX XX
+    let lea_rip_pos = code.len();
+    code.extend_from_slice(&[0x48, 0x8D, 0x05, 0x00, 0x00, 0x00, 0x00]); // placeholder offset
+
+    // mov [rsp+2], rax  => 48 89 44 24 02
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x02]);
+
+    // lgdt [rsp]  => 0F 01 14 24
+    code.extend_from_slice(&[0x0F, 0x01, 0x14, 0x24]);
+
+    // add rsp, 16  => 48 83 C4 10
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x10]);
+
+    emit_serial_char(&mut code, b'G'); // GDT loaded
+
+    // Load segment selectors per 64-bit boot protocol:
+    // DS = ES = SS = __BOOT_DS (0x18)
+    //   mov ax, 0x18  =>  66 B8 18 00
+    code.extend_from_slice(&[0x66, 0xB8, 0x18, 0x00]);
+    //   mov ds, ax  =>  8E D8
+    code.extend_from_slice(&[0x8E, 0xD8]);
+    //   mov es, ax  =>  8E C0
+    code.extend_from_slice(&[0x8E, 0xC0]);
+    //   mov ss, ax  =>  8E D0
+    code.extend_from_slice(&[0x8E, 0xD0]);
+    // FS and GS can be null
     //   xor eax, eax  =>  31 C0
     code.extend_from_slice(&[0x31, 0xC0]);
-    //   mov ds, ax    =>  8E D8
-    code.extend_from_slice(&[0x8E, 0xD8]);
-    //   mov es, ax    =>  8E C0
-    code.extend_from_slice(&[0x8E, 0xC0]);
-    //   mov ss, ax    =>  8E D0
-    code.extend_from_slice(&[0x8E, 0xD0]);
-    //   mov fs, ax    =>  8E E0
+    //   mov fs, ax  =>  8E E0
     code.extend_from_slice(&[0x8E, 0xE0]);
-    //   mov gs, ax    =>  8E E8
+    //   mov gs, ax  =>  8E E8
     code.extend_from_slice(&[0x8E, 0xE8]);
+
+    // Reload CS = __BOOT_CS (0x10) via far return
+    //   push 0x10        =>  6A 10
+    code.extend_from_slice(&[0x6A, 0x10]);
+    //   lea rax, [rip+0] =>  48 8D 05 00 00 00 00  (address of next instruction)
+    let cs_reload_lea_pos = code.len();
+    code.extend_from_slice(&[0x48, 0x8D, 0x05, 0x00, 0x00, 0x00, 0x00]);
+    // The LEA target should be the instruction AFTER lretq
+    //   push rax         =>  50
+    code.push(0x50);
+    //   lretq            =>  48 CB
+    code.extend_from_slice(&[0x48, 0xCB]);
+    // -- execution continues here after lretq with CS=0x10 --
+    let cs_reload_target = code.len();
+    // Patch the LEA offset: target - (lea_pos + 7) = relative offset
+    let cs_rel = (cs_reload_target as i32) - (cs_reload_lea_pos as i32 + 7);
+    code[cs_reload_lea_pos + 3..cs_reload_lea_pos + 7]
+        .copy_from_slice(&cs_rel.to_le_bytes());
 
     // ---- Phase 3: Clear general-purpose registers --------------------------
     //
@@ -525,6 +600,29 @@ fn build_x86_64_trampoline(boot_params_phys: u64, kernel_entry: u64, page_table_
 
     // jmp rax  =>  FF E0
     code.extend_from_slice(&[0xFF, 0xE0]);
+
+    // ---- GDT data (placed after all code) ----------------------------------
+    //
+    // Patch the LEA [rip + offset] to point here.
+    let gdt_data_offset = code.len();
+    let lea_end = lea_rip_pos + 7; // LEA instruction is 7 bytes
+    let gdt_rel = (gdt_data_offset as i32) - (lea_end as i32);
+    code[lea_rip_pos + 3..lea_rip_pos + 7]
+        .copy_from_slice(&gdt_rel.to_le_bytes());
+
+    // GDT entries (4 × 8 bytes = 32 bytes):
+    // Entry 0 (0x00): null descriptor
+    code.extend_from_slice(&[0x00; 8]);
+    // Entry 1 (0x08): unused (padding)
+    code.extend_from_slice(&[0x00; 8]);
+    // Entry 2 (0x10): __BOOT_CS — 64-bit code segment, execute/read, DPL 0
+    //   Limit 0xFFFFF, Base 0, G=1 D=0 L=1 P=1 DPL=0 S=1 Type=0xA (exec/read)
+    //   Bytes: 0xFF 0xFF 0x00 0x00 0x00 0x9A 0xAF 0x00
+    code.extend_from_slice(&[0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xAF, 0x00]);
+    // Entry 3 (0x18): __BOOT_DS — data segment, read/write, DPL 0
+    //   Limit 0xFFFFF, Base 0, G=1 D/B=1 L=0 P=1 DPL=0 S=1 Type=0x2 (read/write)
+    //   Bytes: 0xFF 0xFF 0x00 0x00 0x00 0x92 0xCF 0x00
+    code.extend_from_slice(&[0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF, 0x00]);
 
     code
 }
@@ -818,10 +916,13 @@ fn prepare_x86_64(
     let fdt_buf = fdt.as_bytes().to_vec();
 
     // -- 3. Build boot_params (zero page) ------------------------------------
+    let kernel_init_size = align_up(kernel_blob_size as u64, 0x200000);
     let bp = build_boot_params(
         initrd_phys..initrd_phys + initrd_size,
         cmdline_phys,
         fdt_phys,
+        kernel_load_phys,
+        kernel_init_size,
     )
     .context("failed to build boot_params")?;
 
@@ -899,6 +1000,8 @@ fn build_boot_params(
     initrd: std::ops::Range<u64>,
     cmdline_phys: u64,
     setup_data_phys: u64,
+    kernel_load_phys: u64,
+    kernel_init_size: u64,
 ) -> anyhow::Result<loader_defs::linux::boot_params> {
     use loader_defs::linux::boot_params;
     use zerocopy::FromZeros;
@@ -923,9 +1026,13 @@ fn build_boot_params(
 
     bp.hdr.setup_data = setup_data_phys.into();
 
-    // NOTE: pref_address/init_size/relocatable_kernel are intentionally NOT
-    // set, matching openhcl_boot behavior. The kernel with CONFIG_RELOCATABLE=y
-    // handles relocation via startup_64 without needing these hints.
+    // Per the 64-bit boot protocol, init_size tells the kernel how much
+    // memory to reserve from the load address. pref_address indicates where
+    // the kernel was loaded.
+    bp.hdr.pref_address = kernel_load_phys.into();
+    bp.hdr.init_size = (kernel_init_size as u32).into();
+    bp.hdr.relocatable_kernel = 1;
+    bp.hdr.kernel_alignment = 0x200000u32.into(); // 2MB
 
     build_e820_map(&mut bp)?;
 
