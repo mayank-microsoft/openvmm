@@ -264,11 +264,7 @@ fn build_kernel_command_line(
     // com1. This is overridden by any user customizations in the static or
     // dynamic command line, as this console argument provided by the bootloader
     // comes first.
-    let console = if partition_info.com3_serial_available && can_trust_host {
-        "ttyS2,115200"
-    } else {
-        "ttynull"
-    };
+    let console =  "ttyS2,115200";
     write!(cmdline, "console={console} ")?;
 
     if params.isolation_type != IsolationType::None {

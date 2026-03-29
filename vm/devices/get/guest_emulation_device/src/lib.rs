@@ -1312,7 +1312,6 @@ impl<T: RingMem + Unpin> GedChannel<T> {
         state: &mut GuestEmulationDevice,
     ) -> Result<(), Error> {
         let vpci_boot_enabled;
-        let enable_firmware_debugging;
         let disable_frontpage;
         let firmware_mode_is_pcat;
         let pcat_boot_device_order;
@@ -1321,13 +1320,12 @@ impl<T: RingMem + Unpin> GedChannel<T> {
         match state.config.firmware {
             GuestFirmwareConfig::Uefi {
                 enable_vpci_boot,
-                firmware_debug,
+                firmware_debug: _,
                 disable_frontpage: v_disable_frontpage,
                 console_mode,
                 default_boot_always_attempt: v_default_boot_always_attempt,
             } => {
                 vpci_boot_enabled = enable_vpci_boot;
-                enable_firmware_debugging = firmware_debug;
                 disable_frontpage = v_disable_frontpage;
                 firmware_mode_is_pcat = false;
                 pcat_boot_device_order = None;
@@ -1336,7 +1334,6 @@ impl<T: RingMem + Unpin> GedChannel<T> {
             }
             GuestFirmwareConfig::Pcat { boot_order } => {
                 vpci_boot_enabled = false;
-                enable_firmware_debugging = false;
                 disable_frontpage = false;
                 firmware_mode_is_pcat = true;
                 pcat_boot_device_order = Some(boot_order);
@@ -1357,7 +1354,7 @@ impl<T: RingMem + Unpin> GedChannel<T> {
                     debugger_mode: false,
                     enable_vmbus_redirector: state.config.com2,
                 },
-                enable_firmware_debugging,
+                enable_firmware_debugging: false,
                 enable_tpm: state.config.enable_tpm,
                 secure_boot_enabled: state.config.secure_boot_enabled,
                 secure_boot_template_id: match state.config.secure_boot_template {

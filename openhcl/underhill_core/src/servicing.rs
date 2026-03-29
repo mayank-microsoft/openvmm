@@ -112,6 +112,23 @@ mod state {
 }
 
 impl ServicingState {
+    /// Log the SHA-256 hash of the encoded servicing state bytes for
+    /// debugging dev servicing save/restore issues.
+    pub fn log_data_hash(label: &str, data: &[u8]) {
+        use sha2::Digest;
+        let hash = sha2::Sha256::digest(data);
+        let hash_hex = hash
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+        tracing::info!(
+            label,
+            data_len = data.len(),
+            data_hash = %hash_hex,
+            "dev servicing state hash"
+        );
+    }
+
     /// Update the state with extra data to ensure it can be restored by older
     /// versions of the paravisor.
     pub fn fix_pre_save(&mut self) -> anyhow::Result<()> {

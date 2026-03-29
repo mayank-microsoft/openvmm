@@ -637,6 +637,11 @@ pub fn write_uefi_config(
             platform_config.general.com1_enabled || platform_config.general.com2_enabled,
         );
         flags.set_hibernate_enabled(platform_config.general.hibernation_enabled);
+        tracing::info!(
+            CVM_ALLOWED,
+            firmware_debugging_enabled = platform_config.general.firmware_debugging_enabled,
+            "setting debugger_enabled in UEFI config flags"
+        );
         flags.set_debugger_enabled(platform_config.general.firmware_debugging_enabled);
 
         flags.set_pause_after_boot_failure(platform_config.general.pause_after_boot_failure);

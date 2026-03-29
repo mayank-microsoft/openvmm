@@ -185,7 +185,7 @@ pub struct HclDevicePlatformSettingsV2Static {
 
     // PCAT info
     pub num_lock_enabled: bool,
-    pub pcat_boot_device_order: Option<[PcatBootDevice; 4]>,
+    pub pcat_boot_device_order: Option<Vec<PcatBootDevice>>,
 
     pub smbios: HclDevicePlatformSettingsV2StaticSmbios,
 

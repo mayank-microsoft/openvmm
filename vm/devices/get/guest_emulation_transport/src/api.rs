@@ -110,7 +110,7 @@ pub mod platform_settings {
         pub default_boot_always_attempt: bool,
         pub num_lock_enabled: bool,
         #[inspect(with = "|x| inspect::iter_by_index(x).map_value(inspect::AsDebug)")]
-        pub pcat_boot_device_order: [PcatBootDevice; 4],
+        pub pcat_boot_device_order: Vec<PcatBootDevice>,
 
         pub vpci_instance_filter: Option<Guid>,
         pub nvdimm_count: u16,

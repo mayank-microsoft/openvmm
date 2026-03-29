@@ -392,6 +392,7 @@ impl Worker for UnderhillVmWorker {
                     path = state_path,
                     "dev servicing: found saved state in initramfs"
                 );
+                ServicingState::log_data_hash("pre-restore", &buf);
                 let state: ServicingState = mesh::payload::decode(&buf)
                     .context("dev servicing: failed to decode saved state")?;
                 // Clean up so it doesn't persist across subsequent boots.
@@ -673,6 +674,12 @@ async fn read_device_platform_settings(
     // TODO: figure out if we really need to trace this. These are too long for
     // the Underhill trace buffer.
     tracing::debug!("device platform settings {:?}", dps);
+
+    tracing::info!(
+        CVM_ALLOWED,
+        firmware_debugging_enabled = dps.general.firmware_debugging_enabled,
+        "host-provided firmware_debugging_enabled value"
+    );
 
     Ok(dps)
 }
@@ -2310,7 +2317,7 @@ async fn new_underhill_vm(
                 srat: acpi_builder.build_srat(),
                 hibernation_enabled: dps.general.hibernation_enabled,
                 initial_generation_id,
-                boot_order: dps.general.pcat_boot_device_order.map(|e| {
+                boot_order: dps.general.pcat_boot_device_order.clone().into_iter().map(|e| {
                     use firmware_pcat::config::BootDevice;
                     use firmware_pcat::config::BootDeviceStatus;
                     use guest_emulation_transport::api::platform_settings::PcatBootDevice;
@@ -2327,7 +2334,7 @@ async fn new_underhill_vm(
                         kind,
                         attached: true,
                     }
-                }),
+                }).collect::<Vec<_>>().try_into().unwrap(),
                 num_lock_enabled: dps.general.num_lock_enabled,
                 smbios: firmware_pcat::config::SmbiosConstants {
                     bios_guid: dps.general.bios_guid,
@@ -3674,6 +3681,12 @@ fn validate_isolated_configuration(dps: &DevicePlatformSettings) -> Result<(), a
         anyhow::bail!("processor idle is not supported");
     }
     if *secure_boot_enabled && *firmware_debugging_enabled {
+        tracing::error!(
+            CVM_ALLOWED,
+            secure_boot_enabled,
+            firmware_debugging_enabled,
+            "isolated VM validation failed: secure boot and firmware debugging are mutually exclusive"
+        );
         anyhow::bail!("secure boot and firmware debugging are mutually exclusive");
     }
     if *battery_enabled {

@@ -806,6 +806,7 @@ impl LoadedVm {
         // 5. Serialize the saved state and append it to the initrd as a
         //    CPIO overlay so the next kernel can read it at a known path.
         let state_bytes = mesh::payload::encode(saved_state);
+        ServicingState::log_data_hash("post-save", &state_bytes);
         tracing::debug!(
             state_size = state_bytes.len(),
             "dev servicing: serialized servicing state"

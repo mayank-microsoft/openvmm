@@ -1188,7 +1188,7 @@ where
         )
         .map_err(Error::Importer)?;
 
-    let mut measured_config = ParavisorMeasuredVtl0Config {
+    let mut measured_config: ParavisorMeasuredVtl0Config = ParavisorMeasuredVtl0Config {
         magic: ParavisorMeasuredVtl0Config::MAGIC,
         ..FromZeros::new_zeroed()
     };

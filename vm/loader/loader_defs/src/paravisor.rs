@@ -163,7 +163,7 @@ pub struct PageRegionDescriptor {
 #[cfg(feature = "inspect")]
 impl Inspect for PageRegionDescriptor {
     fn inspect(&self, req: inspect::Request<'_>) {
-        let pages = self.pages();
+        let pages: Option<(u64, u64)> = self.pages();
 
         match pages {
             None => {

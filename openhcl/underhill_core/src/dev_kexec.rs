@@ -276,8 +276,68 @@ fn align_up(addr: u64, alignment: u64) -> u64 {
 /// - RDI → 0
 ///
 /// Returns the raw machine code bytes.
+/// Build identity-mapped 4-level page tables using 2MB pages.
+///
+/// Covers physical addresses from 0 to `max_phys_addr`, providing the
+/// identity mapping that `startup_64` expects. `base_phys` is the physical
+/// address where this buffer will be placed; CR3 should be set to it.
 #[cfg(target_arch = "x86_64")]
-fn build_x86_64_trampoline(boot_params_phys: u64, kernel_entry: u64) -> Vec<u8> {
+fn build_identity_page_tables(base_phys: u64, max_phys_addr: u64) -> Vec<u8> {
+    const PT_PAGE: usize = 4096;
+    const ENTRY: usize = 8;
+    const ENTRIES_PER_PAGE: usize = 512;
+    const P: u64 = 1;       // Present
+    const RW: u64 = 1 << 1; // Read/Write
+    const PS: u64 = 1 << 7; // Page Size (2MB at PD level)
+
+    // Number of 1GB regions to cover (each needs one PD page).
+    let num_gb = ((max_phys_addr + (1u64 << 30) - 1) >> 30) as usize;
+    // Layout: page 0 = PML4, page 1 = PDPT, pages 2.. = PD tables.
+    let total_pages = 2 + num_gb;
+    let mut buf = vec![0u8; total_pages * PT_PAGE];
+
+    let pml4_off = 0usize;
+    let pdpt_off = PT_PAGE;
+
+    // PML4[0] → PDPT
+    let pdpt_phys = base_phys + pdpt_off as u64;
+    buf[pml4_off..pml4_off + ENTRY]
+        .copy_from_slice(&(pdpt_phys | P | RW).to_le_bytes());
+
+    for gb in 0..num_gb {
+        let pd_off = (2 + gb) * PT_PAGE;
+        let pd_phys = base_phys + pd_off as u64;
+
+        // PDPT[gb] → PD page
+        let e_off = pdpt_off + gb * ENTRY;
+        buf[e_off..e_off + ENTRY]
+            .copy_from_slice(&(pd_phys | P | RW).to_le_bytes());
+
+        // Fill PD with 2MB identity-mapped entries.
+        for i in 0..ENTRIES_PER_PAGE {
+            let phys_2mb = ((gb * ENTRIES_PER_PAGE + i) as u64) << 21;
+            if phys_2mb >= max_phys_addr {
+                break;
+            }
+            let off = pd_off + i * ENTRY;
+            buf[off..off + ENTRY]
+                .copy_from_slice(&(phys_2mb | PS | P | RW).to_le_bytes());
+        }
+    }
+
+    tracing::info!(
+        base_phys = %format_args!("{:#x}", base_phys),
+        max_phys_addr = %format_args!("{:#x}", max_phys_addr),
+        num_gb_regions = num_gb,
+        total_pages = total_pages,
+        "built identity-mapped page tables (2MB pages)"
+    );
+
+    buf
+}
+
+#[cfg(target_arch = "x86_64")]
+fn build_x86_64_trampoline(boot_params_phys: u64, kernel_entry: u64, page_table_phys: u64) -> Vec<u8> {
     let mut code = Vec::with_capacity(256);
 
     // Helper: emit instructions to write one character to COM3 with
@@ -366,11 +426,12 @@ fn build_x86_64_trampoline(boot_params_phys: u64, kernel_entry: u64) -> Vec<u8> 
     code.extend_from_slice(&[0xB8, 0x33, 0x00, 0x01, 0x80]);
     code.extend_from_slice(&[0x0F, 0x22, 0xC0]);
 
-    // Flush TLB by reloading CR3 (the identity-map page table base set
-    // up by kexec's relocate_kernel).
-    //   mov rax, cr3   =>  0F 20 D8
-    //   mov cr3, rax   =>  0F 22 D8
-    code.extend_from_slice(&[0x0F, 0x20, 0xD8]);
+    // Load our identity-mapped page tables into CR3.
+    //   movabs rax, <page_table_phys>  =>  48 B8 <imm64>
+    //   mov cr3, rax                   =>  0F 22 D8
+    code.push(0x48);
+    code.push(0xB8);
+    code.extend_from_slice(&page_table_phys.to_le_bytes());
     code.extend_from_slice(&[0x0F, 0x22, 0xD8]);
 
     // Clear all debug registers to remove stale hardware breakpoints and
@@ -698,6 +759,19 @@ fn prepare_x86_64(
     let boot_params_memsz = PAGE_SIZE as usize;
     next_addr += boot_params_memsz as u64;
 
+    // Identity-mapped page tables (2MB pages covering all VTL2 memory).
+    let max_phys_addr = boot_dt_info
+        .vtl2_memory
+        .iter()
+        .map(|r| r.range.end())
+        .max()
+        .unwrap_or(0);
+    let num_pt_gb = ((max_phys_addr + (1u64 << 30) - 1) >> 30) as usize;
+    let page_table_phys = next_addr;
+    let page_table_pages = 2 + num_pt_gb; // PML4 + PDPT + PD pages
+    let page_table_memsz = page_table_pages * PAGE_SIZE as usize;
+    next_addr += page_table_memsz as u64;
+
     // Verify everything fits in the RAM range.
     anyhow::ensure!(
         next_addr <= largest_ram.range.end(),
@@ -744,7 +818,10 @@ fn prepare_x86_64(
     // The trampoline sets up the register state that the Linux 64-bit boot
     // protocol requires (RSI = &boot_params, RDI = 0) and then jumps to the
     // real kernel entry point.
-    let trampoline_buf = build_x86_64_trampoline(boot_params_phys, kernel_entry_phys);
+    // Build identity-mapped page tables.
+    let page_table_buf = build_identity_page_tables(page_table_phys, max_phys_addr);
+
+    let trampoline_buf = build_x86_64_trampoline(boot_params_phys, kernel_entry_phys, page_table_phys);
 
     tracing::info!(
         trampoline_phys = %format_args!("{:#x}", trampoline_phys),
@@ -790,6 +867,11 @@ fn prepare_x86_64(
         data: boot_params_buf,
         phys_addr: boot_params_phys,
         mem_size: boot_params_memsz,
+    });
+    segments.push(KexecSegment {
+        data: page_table_buf,
+        phys_addr: page_table_phys,
+        mem_size: page_table_memsz,
     });
 
     Ok((trampoline_phys, segments))

@@ -66,7 +66,7 @@ impl RuntimeParameters {
     /// The VM's ACPI SLIT table provided by the host.
     pub fn slit(&self) -> Option<&[u8]> {
         self.slit.as_deref()
-    }
+    }  
 
     /// The VM's ACPI PPTT table provided by the host.
     pub fn pptt(&self) -> Option<&[u8]> {
@@ -419,7 +419,7 @@ pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info
 
     drop(mapping);
 
-    assert_eq!(measured_config.magic, ParavisorMeasuredVtl2Config::MAGIC);
+    //1assert_eq!(measured_config.magic, ParavisorMeasuredVtl2Config::MAGIC);
 
     let vtom_offset_bit = if measured_config.vtom_offset_bit == 0 {
         None

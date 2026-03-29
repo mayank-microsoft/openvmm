@@ -198,6 +198,9 @@ impl GuestEmulationTransportClient {
             .call(msg::Msg::DevicePlatformSettingsV2, ())
             .await;
 
+        let j = String::from_utf8_lossy(json.as_ref());
+        tracing::info!("got platform settings json: {j}");
+
         let json =
             serde_json::from_slice::<get_protocol::dps_json::DevicePlatformSettingsV2Json>(&json)
                 .map_err(crate::error::DevicePlatformSettingsError::BadJson)?;
@@ -334,7 +337,7 @@ impl GuestEmulationTransportClient {
                         PcatBootDevice::Optical,
                         PcatBootDevice::HardDrive,
                         PcatBootDevice::Network,
-                    ]
+                    ].to_vec()
                 }),
                 is_servicing_scenario: json.v2.dynamic.is_servicing_scenario,
                 firmware_mode_is_pcat: json.v2.r#static.firmware_mode_is_pcat,
