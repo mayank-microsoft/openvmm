@@ -9,11 +9,6 @@
 //! `openhcl_boot` so that the newly kexec'd kernel receives the same
 //! environment the original boot shim would have provided.
 //!
-//! The device tree is handled by cloning the raw FDT from `/sys/firmware/fdt`
-//! (the exact blob the current kernel booted with) and patching only the
-//! initrd location and command line. This avoids manually reconstructing
-//! the entire tree and ensures perfect fidelity with the original boot.
-//!
 //! # Segment layout
 //!
 //! ## x86_64
@@ -56,6 +51,7 @@ pub const DEV_SERVICING_STATE_PATH: &str = "/openhcl/dev_servicing_state.bin";
 pub const DEV_SERVICING_CMDLINE_MARKER: &str = "OPENHCL_SERVICING_COMPLETED=1";
 
 /// Build a minimal CPIO "newc" archive containing a single file at the
+/// given `path` with `contents`.
 ///
 /// The returned bytes form a complete CPIO archive (including the
 /// `TRAILER!!!` sentinel) that can be concatenated onto an existing
@@ -566,8 +562,8 @@ pub fn prepare_kexec_segments(
     // Enable early console output on COM3 (I/O 0x3E8 = ttyS2) so that
     // kernel boot messages are visible via the Hyper-V COM3 pipe /
     // ohcldiag-dev serial as soon as the new kernel starts executing.
-    // data.command_line
-    //     .push_str(" earlycon=uart8250,io,0x3e8,115200n8 console=ttyS2,115200n8");
+    data.command_line
+        .push_str(" earlycon=uart8250,io,0x3e8,115200n8 console=ttyS2,115200n8");
 
     cfg_if::cfg_if! {
         if #[cfg(target_arch = "x86_64")] {
@@ -586,7 +582,7 @@ pub fn prepare_kexec_segments(
 fn prepare_x86_64(
     data: DevServicingData,
     vmlinux_info: &VmlinuxInfo,
-    _boot_dt_info: &ParsedBootDtInfo,
+    boot_dt_info: &ParsedBootDtInfo,
 ) -> anyhow::Result<(u64, Vec<KexecSegment>)> {
     use loader_defs::linux::SETUP_DTB;
     use loader_defs::linux::setup_data;
@@ -597,7 +593,9 @@ fn prepare_x86_64(
         "ELF vmlinux has no PT_LOAD segments"
     );
 
-    const PHYSICAL_ALIGN: u64 = 2 * 1024 * 1024; // 2 MB
+    // OpenHCL runs identity-mapped (vaddr == paddr), so e_entry is already
+    // the physical entry point.
+    let kernel_entry_phys = vmlinux_info.entry_point;
 
     for seg in &vmlinux_info.segments {
         tracing::info!(
@@ -610,54 +608,32 @@ fn prepare_x86_64(
         );
     }
 
-    // -- 1. Find usable RAM and lay out all segments sequentially -------------
+    // -- 1. Determine physical addresses for each segment --------------------
     //
-    // Instead of using the ELF p_paddr values (which may point into VTL0
-    // guest RAM), we place ALL segments linearly into the largest
-    // contiguous System RAM region. The kernel must have
-    // CONFIG_RELOCATABLE=y so it can boot from any 2 MB-aligned address.
-    //
-    // Layout (packed sequentially, each page-aligned):
-    //   [kernel seg 0] [kernel seg 1] ... [kernel seg N]
-    //   [trampoline] [initrd] [cmdline] [FDT] [boot_params]
+    // During kexec, the kernel copies segments to the specified physical
+    // addresses. ELF LOAD segments go to their p_paddr. Other segments
+    // (trampoline, initrd, FDT, boot_params, cmdline) are placed after
+    // the highest ELF segment in the largest VTL2 RAM range.
 
-    let usable_ram = find_largest_system_ram()
-        .context("finding System RAM for kexec placement")?;
+    let largest_ram = boot_dt_info
+        .vtl2_memory
+        .iter()
+        .max_by_key(|r| r.range.len())
+        .context("no VTL2 memory ranges available")?;
 
     tracing::info!(
-        range_start = %format_args!("{:#x}", usable_ram.start),
-        range_end = %format_args!("{:#x}", usable_ram.end),
-        range_len = %format_args!("{:#x}", usable_ram.end - usable_ram.start),
-        "using System RAM range from /proc/iomem for kexec segment placement"
+        range_start = %format_args!("{:#x}", largest_ram.range.start()),
+        range_len = %format_args!("{:#x}", largest_ram.range.len()),
+        "using VTL2 RAM range for kexec segment placement"
     );
 
-    // Start at a 2 MB-aligned address within the RAM range.
-    let kernel_load_phys = align_up(usable_ram.start, PHYSICAL_ALIGN);
-
-    // Build a single contiguous kernel image buffer covering the entire
-    // physical range from the first to the last ELF segment. Each
-    // PT_LOAD segment's data is placed at its correct offset within
-    // the buffer (paddr - lowest_paddr). Gaps between segments are
-    // zero-filled. This avoids multi-segment kexec complexity and
-    // ensures the kernel's inter-segment layout is perfectly preserved.
-    let lowest_seg_paddr = vmlinux_info
-        .segments
-        .iter()
-        .map(|s| s.paddr)
-        .min()
-        .unwrap();
-
-    let highest_seg_end = vmlinux_info
-        .segments
-        .iter()
-        .map(|s| s.paddr + align_up(s.mem_size, PAGE_SIZE))
-        .max()
-        .unwrap();
-
-    let kernel_image_size = align_up(highest_seg_end - lowest_seg_paddr, PAGE_SIZE) as usize;
-    let mut kernel_buf = vec![0u8; kernel_image_size];
-
+    // Build kexec segments for each ELF PT_LOAD, loading at p_paddr.
+    let mut kernel_segments = Vec::new();
+    let mut highest_seg_end: u64 = 0;
     for seg in &vmlinux_info.segments {
+        let seg_memsz = align_up(seg.mem_size, PAGE_SIZE) as usize;
+
+        // Extract the segment data from the raw ELF file.
         let file_start = seg.file_offset as usize;
         let file_end = file_start + seg.file_size as usize;
         anyhow::ensure!(
@@ -668,54 +644,42 @@ fn prepare_x86_64(
             data.vmlinux.len()
         );
 
-        // Place segment data at its offset within the flat image.
-        let buf_offset = (seg.paddr - lowest_seg_paddr) as usize;
-        kernel_buf[buf_offset..buf_offset + seg.file_size as usize]
-            .copy_from_slice(&data.vmlinux[file_start..file_end]);
-        // BSS (mem_size > file_size) is already zero from vec![0u8; ...].
+        // Build the segment data: file contents + zero-fill for BSS.
+        let mut seg_data = data.vmlinux[file_start..file_end].to_vec();
+        if seg.mem_size > seg.file_size {
+            seg_data.resize(seg.mem_size as usize, 0);
+        }
 
-        tracing::info!(
-            original_paddr = %format_args!("{:#x}", seg.paddr),
-            placed_at = %format_args!("{:#x}", kernel_load_phys + buf_offset as u64),
-            file_size = %format_args!("{:#x}", seg.file_size),
-            mem_size = %format_args!("{:#x}", seg.mem_size),
-            "placed ELF segment into flat kernel image"
-        );
+        let seg_end = seg.paddr + seg_memsz as u64;
+        if seg_end > highest_seg_end {
+            highest_seg_end = seg_end;
+        }
+
+        kernel_segments.push(KexecSegment {
+            data: seg_data,
+            phys_addr: seg.paddr,
+            mem_size: seg_memsz,
+        });
     }
 
-    tracing::info!(
-        kernel_load_phys = %format_args!("{:#x}", kernel_load_phys),
-        kernel_image_size = %format_args!("{:#x}", kernel_image_size),
-        "built flat kernel image"
-    );
-
-    let mut next_addr = kernel_load_phys + kernel_image_size as u64;
-
-    let kernel_entry_phys = kernel_load_phys + (vmlinux_info.entry_point - lowest_seg_paddr);
-    tracing::info!(
-        original_entry = %format_args!("{:#x}", vmlinux_info.entry_point),
-        kernel_entry_phys = %format_args!("{:#x}", kernel_entry_phys),
-        kernel_load_phys = %format_args!("{:#x}", kernel_load_phys),
-        "kernel entry point"
-    );
+    // Place auxiliary segments after the kernel's highest segment.
+    let mut next_addr = align_up(highest_seg_end, PAGE_SIZE);
 
     // Trampoline
-    next_addr = align_up(next_addr, PAGE_SIZE);
     let trampoline_phys = next_addr;
     let trampoline_memsz = PAGE_SIZE as usize;
     next_addr += trampoline_memsz as u64;
 
     // Initrd
-    next_addr = align_up(next_addr, PAGE_SIZE);
-    let initrd_phys = next_addr;
+    let initrd_phys = align_up(next_addr, PAGE_SIZE);
     let initrd_size = data.initrd.len() as u64;
     let initrd_memsz = align_up(initrd_size, PAGE_SIZE) as usize;
-    next_addr += initrd_memsz as u64;
+    next_addr = initrd_phys + initrd_memsz as u64;
 
     // Command line (null-terminated)
     let cmdline_phys = next_addr;
     let mut cmdline_buf = data.command_line.as_bytes().to_vec();
-    cmdline_buf.push(0);
+    cmdline_buf.push(0); // null-terminate
     let cmdline_memsz = align_up(cmdline_buf.len() as u64, PAGE_SIZE) as usize;
     next_addr += cmdline_memsz as u64;
 
@@ -731,38 +695,35 @@ fn prepare_x86_64(
 
     // Verify everything fits in the RAM range.
     anyhow::ensure!(
-        next_addr <= usable_ram.end,
-        "kexec segments [{:#x}..{:#x}) ({:#x} bytes) do not fit in System RAM [{:#x}..{:#x})",
-        kernel_load_phys,
-        next_addr,
-        next_addr - kernel_load_phys,
-        usable_ram.start,
-        usable_ram.end,
+        next_addr <= largest_ram.range.end(),
+        "kexec segments ({:#x} bytes) exceed VTL2 RAM range (ends at {:#x})",
+        next_addr - largest_ram.range.start(),
+        largest_ram.range.end()
     );
 
     // -- 2. Build the device tree --------------------------------------------
     let mut fdt = Fdt {
         header: setup_data {
-            next: 0,
+            next: 0, // no further setup_data nodes
             ty: SETUP_DTB,
             len: (FDT_SIZE - size_of::<setup_data>()) as u32,
         },
         data: [0u8; FDT_SIZE - size_of::<setup_data>()],
     };
 
-    clone_and_patch_device_tree(
+    // Build the FDT into the data portion (after the setup_data header).
+    build_device_tree(
         &mut fdt.data,
+        boot_dt_info,
         initrd_phys..initrd_phys + initrd_size,
         &data.command_line,
     )
-    .context("failed to clone device tree for kexec")?;
+    .context("failed to build device tree for kexec")?;
 
     let fdt_buf = fdt.as_bytes().to_vec();
 
     // -- 3. Build boot_params (zero page) ------------------------------------
     let bp = build_boot_params(
-        kernel_load_phys,
-        next_addr,
         initrd_phys..initrd_phys + initrd_size,
         cmdline_phys,
         fdt_phys,
@@ -774,6 +735,10 @@ fn prepare_x86_64(
     let boot_params_buf = bp.as_bytes().to_vec();
 
     // -- 4. Build the trampoline ---------------------------------------------
+    //
+    // The trampoline sets up the register state that the Linux 64-bit boot
+    // protocol requires (RSI = &boot_params, RDI = 0) and then jumps to the
+    // real kernel entry point.
     let trampoline_buf = build_x86_64_trampoline(boot_params_phys, kernel_entry_phys);
 
     tracing::info!(
@@ -784,19 +749,19 @@ fn prepare_x86_64(
     );
 
     // -- 5. Assemble segments ------------------------------------------------
+    //
+    // The trampoline is the first segment and its physical address is the
+    // kexec entry point. Kernel ELF segments follow.
     let mut segments = vec![KexecSegment {
         data: trampoline_buf,
         phys_addr: trampoline_phys,
         mem_size: trampoline_memsz,
     }];
 
-    // Single contiguous kernel image segment.
-    segments.push(KexecSegment {
-        data: kernel_buf,
-        phys_addr: kernel_load_phys,
-        mem_size: kernel_image_size,
-    });
+    // Add all kernel ELF PT_LOAD segments.
+    segments.extend(kernel_segments);
 
+    // Add initrd, cmdline, FDT, and boot_params.
     segments.push(KexecSegment {
         data: data.initrd,
         phys_addr: initrd_phys,
@@ -824,8 +789,6 @@ fn prepare_x86_64(
 /// Construct `boot_params` (zero page) mimicking `openhcl_boot`.
 #[cfg(target_arch = "x86_64")]
 fn build_boot_params(
-    kernel_load_phys: u64,
-    segments_end_phys: u64,
     initrd: std::ops::Range<u64>,
     cmdline_phys: u64,
     setup_data_phys: u64,
@@ -853,69 +816,12 @@ fn build_boot_params(
 
     bp.hdr.setup_data = setup_data_phys.into();
 
-    // Tell the kernel where it is loaded and how much memory to reserve.
-    // init_size covers all kexec segments (kernel text, initrd, FDT, etc.)
-    // from the kernel load address to the end. Without this, the kernel's
-    // early memory allocator may overwrite its own code pages.
-    bp.hdr.pref_address = kernel_load_phys.into();
-    let init_size = (segments_end_phys - kernel_load_phys) as u32;
-    bp.hdr.init_size = init_size.into();
-    bp.hdr.relocatable_kernel = 1;
-    bp.hdr.kernel_alignment = (2 * 1024 * 1024_u32).into(); // 2 MB
-    tracing::info!(
-        pref_address = %format_args!("{:#x}", kernel_load_phys),
-        init_size = %format_args!("{:#x}", init_size),
-        "boot_params: kernel load reservation"
-    );
     build_e820_map(&mut bp)?;
 
     Ok(bp)
 }
 
 /// Build the e820 memory map by parsing `/proc/iomem`.
-
-/// Find the largest contiguous "System RAM" range from `/proc/iomem`.
-///
-/// The kernel's e820 map is built from `/proc/iomem`, and the kexec'd
-/// kernel will reject pages that are not marked as `E820_TYPE_RAM`.
-/// The device-tree VTL2 range may start earlier than the first System RAM
-/// entry (e.g. firmware reserves a small region at the base), so we must
-/// place kexec segments within an actual System RAM range to avoid the
-/// kernel removing its own `.text` from the memory map.
-#[cfg(target_arch = "x86_64")]
-fn find_largest_system_ram() -> anyhow::Result<std::ops::Range<u64>> {
-    let iomem = std::fs::read_to_string("/proc/iomem")
-        .context("failed to read /proc/iomem for System RAM discovery")?;
-
-    let mut best: Option<std::ops::Range<u64>> = None;
-
-    for line in iomem.lines() {
-        // Only top-level entries (non-indented).
-        if line.starts_with(' ') || line.starts_with('\t') {
-            continue;
-        }
-        let Some((range_part, desc_part)) = line.split_once(" : ") else {
-            continue;
-        };
-        if desc_part.trim() != "System RAM" {
-            continue;
-        }
-        let Some((start_hex, end_hex)) = range_part.trim().split_once('-') else {
-            continue;
-        };
-        let start = u64::from_str_radix(start_hex.trim(), 16)
-            .with_context(|| format!("bad iomem start {:?}", start_hex))?;
-        let end = u64::from_str_radix(end_hex.trim(), 16)
-            .with_context(|| format!("bad iomem end {:?}", end_hex))?;
-        let size = end.saturating_sub(start).saturating_add(1);
-
-        if best.as_ref().map_or(true, |b| size > (b.end - b.start)) {
-            best = Some(start..end + 1);
-        }
-    }
-
-    best.context("no System RAM found in /proc/iomem")
-}
 ///
 /// `/proc/iomem` is always available and reflects the kernel's view of the
 /// physical address space. Only top-level (non-indented) entries are used,
@@ -1025,22 +931,19 @@ fn prepare_aarch64(
 ) -> anyhow::Result<(u64, Vec<KexecSegment>)> {
     let entry_point = vmlinux_info.entry_point;
 
-    // Use the actual System RAM ranges from /proc/iomem rather than the
-    // device-tree VTL2 range. The DT range may include a small reserved
-    // region at the base that is not marked as System RAM in the e820 map.
-    // Placing the kernel there causes the new kernel to remove its own
-    // .text from the memory map ("not marked as E820_TYPE_RAM!").
-    let usable_ram = find_largest_system_ram()
-        .context("finding System RAM for kexec placement")?;
+    let largest_ram = boot_dt_info
+        .vtl2_memory
+        .iter()
+        .max_by_key(|r| r.range.len())
+        .context("no VTL2 memory ranges available")?;
 
     tracing::info!(
-        range_start = %format_args!("{:#x}", usable_ram.start),
-        range_end = %format_args!("{:#x}", usable_ram.end),
-        range_len = %format_args!("{:#x}", usable_ram.end - usable_ram.start),
-        "using System RAM range from /proc/iomem for kexec segment placement"
+        range_start = %format_args!("{:#x}", largest_ram.range.start()),
+        range_len = %format_args!("{:#x}", largest_ram.range.len()),
+        "using VTL2 RAM range for kexec segment placement"
     );
 
-    let mut next_addr = align_up(usable_ram.start + 2 * 1024 * 1024, PAGE_SIZE);
+    let mut next_addr = align_up(largest_ram.range.start() + 2 * 1024 * 1024, PAGE_SIZE);
 
     // Trampoline (placed first; its address becomes the kexec entry point)
     let trampoline_phys = next_addr;
@@ -1072,21 +975,21 @@ fn prepare_aarch64(
 
     // Verify everything fits.
     anyhow::ensure!(
-        next_addr <= usable_ram.end,
+        next_addr <= largest_ram.range.end(),
         "kexec segments ({:#x} bytes) exceed VTL2 RAM range (ends at {:#x})",
-        next_addr - usable_ram.start,
-        usable_ram.end
+        next_addr - largest_ram.range.start(),
+        largest_ram.range.end()
     );
 
-    // Clone the boot device tree, patching the /chosen node with the
-    // new initrd location and command line.
+    // Build the device tree.
     let mut fdt_buf = vec![0u8; FDT_SIZE];
-    clone_and_patch_device_tree(
+    build_device_tree(
         &mut fdt_buf,
+        boot_dt_info,
         initrd_phys..initrd_phys + initrd_size,
         &data.command_line,
     )
-    .context("failed to clone device tree for kexec")?;
+    .context("failed to build device tree for kexec")?;
 
     // Build the trampoline.
     //
@@ -1134,342 +1037,559 @@ fn prepare_aarch64(
 
 // ---- Device tree construction ----------------------------------------------
 
-/// Property patches to apply when cloning the boot device tree.
+/// Build a device tree blob suitable for the kexec'd kernel.
 ///
-/// During dev servicing kexec, the device tree should be identical to the
-/// one the current kernel booted with, except for a small set of properties
-/// that reflect the new initrd location and command line.
-struct DtPatches<'a> {
-    /// New initrd physical address range.
-    initrd: std::ops::Range<u64>,
-    /// New kernel command line string.
-    cmdline: &'a str,
-}
-
-/// Clone the current boot device tree, patching only the initrd location
-/// and command line.
+/// This reconstructs the device tree that `openhcl_boot::dt::write_dt` would
+/// produce, using information parsed from the current boot's device tree.
 ///
-/// Instead of manually reconstructing the entire device tree from parsed
-/// fields (which is fragile and can drift from what `openhcl_boot` produces),
-/// this function reads the raw FDT blob from `/sys/firmware/fdt` — the exact
-/// device tree the current kernel booted with — and clones it into `buffer`.
-/// On aarch64, the `/chosen` node's `bootargs`, `linux,initrd-start`, and
-/// `linux,initrd-end` properties are patched with the new values. On x86_64,
-/// these values live in `boot_params` (the zero page), not in the FDT, so
-/// the tree is cloned verbatim.
-///
-/// The tree is walked iteratively using an explicit stack (no recursion).
-/// The parsed tree is first flattened into a linear event list, then the
-/// events are written directly as raw FDT binary tokens into the output
-/// buffer. This avoids fighting the FDT builder's type-state pattern
-/// which prevents dynamic nesting in a flat loop.
-///
-/// This ensures the kexec'd kernel sees exactly the same device tree as the
-/// original boot, preserving all nodes (cpus, memory, GIC, openhcl, etc.)
-/// without risk of omitting or misordering properties.
-fn clone_and_patch_device_tree(
+/// The FDT includes:
+/// - `/hypervisor` with `compatible = "microsoft,hyperv"`
+/// - `/cpus` with per-vCPU nodes containing reg and NUMA info
+/// - `/memory@` nodes for VTL2 RAM ranges
+/// - `/bus/vmbus` VMBus device nodes with MMIO ranges
+/// - `/openhcl` node with isolation type, memory allocation mode, partition
+///   memory map, MMIO ranges, and accepted memory ranges
+/// - `/chosen` node (aarch64) with bootargs and initrd info
+/// - GIC, timer, PMU, PSCI nodes (aarch64)
+fn build_device_tree(
     buffer: &mut [u8],
+    boot_dt_info: &ParsedBootDtInfo,
     initrd: std::ops::Range<u64>,
     cmdline: &str,
 ) -> anyhow::Result<()> {
-    let patches = DtPatches { initrd, cmdline };
+    use bootloader_fdt_parser::AddressRange;
+    use fdt::builder::Builder;
+    use fdt::builder::BuilderConfig;
 
-    // Read the raw FDT that the current kernel was booted with.
-    let raw_fdt =
-        std::fs::read("/sys/firmware/fdt").context("failed to read /sys/firmware/fdt")?;
-
-    // The FDT parser requires 4-byte aligned input. Use a u32-aligned
-    // Vec to guarantee this, then copy the raw bytes into it.
-    let fdt_len = raw_fdt.len();
-    let num_u32 = (fdt_len + 3) / 4;
-    let mut aligned_fdt: Vec<u32> = vec![0u32; num_u32];
-    zerocopy::IntoBytes::as_mut_bytes(aligned_fdt.as_mut_slice())[..fdt_len]
-        .copy_from_slice(&raw_fdt);
-    let fdt_slice = &zerocopy::IntoBytes::as_bytes(aligned_fdt.as_slice())[..fdt_len];
-
-    let parser = fdt::parser::Parser::new(fdt_slice)
-        .map_err(|e| anyhow::anyhow!("failed to parse boot FDT: {e}"))?;
-
-    // Collect memory reservations from the source FDT.
-    let memory_reservations: Vec<fdt::ReserveEntry> =
-        parser.memory_reservations().map(|r| r.unwrap()).collect();
-
-    let boot_cpuid_phys = parser.boot_cpuid_phys;
-    let root = parser
-        .root()
-        .map_err(|e| anyhow::anyhow!("failed to get FDT root: {e}"))?;
-
-    // Phase 1: Flatten the tree iteratively into events.
-    let events = flatten_fdt_tree(&root, &patches)?;
-
-    // Phase 2: Write the FDT blob directly into the output buffer.
-    //
-    // The FDT builder crate uses a type-state pattern (Nest<T>) that
-    // changes the Builder's Rust type with each start_node / end_node
-    // call. This makes a flat iterative loop over dynamically-nested
-    // events impossible through the builder's public API. Instead, we
-    // write the FDT binary format directly. The format is simple:
-    //
-    //   [Header (40 bytes)]
-    //   [Memory reservation entries + sentinel (0,0)]
-    //   [String table]
-    //   [Struct table: sequence of tokens]
-    //   - BEGIN_NODE (1) + name (null-terminated, 4-byte aligned)
-    //   - PROP (3) + PropHeader { len, nameoff } + data (4-byte aligned)
-    //   - END_NODE (2)
-    //   - END (9)
-    //
-    // All multi-byte values are big-endian.
-
-    // FDT format constants.
-    const FDT_MAGIC: u32 = 0xd00dfeed;
-    const FDT_VERSION: u32 = 17;
-    const FDT_COMPAT_VERSION: u32 = 16;
-    const FDT_BEGIN_NODE: u32 = 1;
-    const FDT_END_NODE: u32 = 2;
-    const FDT_PROP: u32 = 3;
-    const FDT_END: u32 = 9;
-    const HEADER_SIZE: usize = 40;
-    const RESERVE_ENTRY_SIZE: usize = 16; // sizeof(ReserveEntry) = 8+8
-
-    // --- Build the string table ---
-    // Collect unique property names and assign offsets.
-    let mut string_table = Vec::<u8>::new();
-    let mut string_offsets: std::collections::HashMap<String, u32> =
-        std::collections::HashMap::new();
-    for event in &events {
-        if let FdtEvent::Property { name, .. } = event {
-            if !string_offsets.contains_key(name.as_str()) {
-                let offset = string_table.len() as u32;
-                string_table.extend_from_slice(name.as_bytes());
-                string_table.push(0); // null terminator
-                string_offsets.insert(name.clone(), offset);
-            }
-        }
-    }
-
-    // --- Build the struct table ---
-    let mut struct_table = Vec::<u8>::new();
-    for event in &events {
-        match event {
-            FdtEvent::BeginNode(name) => {
-                struct_table.extend_from_slice(&FDT_BEGIN_NODE.to_be_bytes());
-                struct_table.extend_from_slice(name.as_bytes());
-                struct_table.push(0); // null terminator
-                // Align to 4 bytes.
-                while struct_table.len() % 4 != 0 {
-                    struct_table.push(0);
-                }
-            }
-            FdtEvent::Property { name, data } => {
-                let nameoff = *string_offsets.get(name.as_str()).unwrap();
-                struct_table.extend_from_slice(&FDT_PROP.to_be_bytes());
-                // PropHeader: len (u32be) + nameoff (u32be)
-                struct_table.extend_from_slice(&(data.len() as u32).to_be_bytes());
-                struct_table.extend_from_slice(&nameoff.to_be_bytes());
-                struct_table.extend_from_slice(data);
-                // Align to 4 bytes.
-                while struct_table.len() % 4 != 0 {
-                    struct_table.push(0);
-                }
-            }
-            FdtEvent::EndNode => {
-                struct_table.extend_from_slice(&FDT_END_NODE.to_be_bytes());
-            }
-        }
-    }
-    // Final END token.
-    struct_table.extend_from_slice(&FDT_END.to_be_bytes());
-
-    // --- Compute layout offsets ---
-    // Use the standard FDT layout order: header, memory reservations,
-    // struct table, string table. Placing the struct table before the
-    // string table guarantees its offset is 4-byte aligned (the header
-    // is 40 bytes and each reservation entry is 16 bytes, both multiples
-    // of 4, and the struct table itself only contains 4-byte-aligned
-    // tokens). The string table has no alignment requirement.
-    let mem_rsv_off = HEADER_SIZE;
-    // Each reservation entry is 16 bytes, plus the sentinel (0,0).
-    let mem_rsv_size = (memory_reservations.len() + 1) * RESERVE_ENTRY_SIZE;
-    let struct_table_off = mem_rsv_off + mem_rsv_size;
-    let string_table_off = struct_table_off + struct_table.len();
-    let total_size = string_table_off + string_table.len();
-
-    anyhow::ensure!(
-        total_size <= buffer.len(),
-        "FDT output buffer too small: need {total_size} bytes, have {}",
-        buffer.len()
-    );
-
-    // --- Write everything into the output buffer ---
-
-    // Memory reservation entries.
-    for (i, entry) in memory_reservations.iter().enumerate() {
-        let off = mem_rsv_off + i * RESERVE_ENTRY_SIZE;
-        zerocopy::IntoBytes::write_to_prefix(entry, &mut buffer[off..off + RESERVE_ENTRY_SIZE])
-            .map_err(|_| anyhow::anyhow!("failed to write memory reservation entry"))?;
-    }
-    // Sentinel entry (0, 0).
-    let sentinel_off = mem_rsv_off + memory_reservations.len() * RESERVE_ENTRY_SIZE;
-    buffer[sentinel_off..sentinel_off + RESERVE_ENTRY_SIZE].fill(0);
-
-    // Struct table.
-    buffer[struct_table_off..struct_table_off + struct_table.len()]
-        .copy_from_slice(&struct_table);
-
-    // String table.
-    buffer[string_table_off..string_table_off + string_table.len()]
-        .copy_from_slice(&string_table);
-
-    // Header (written last so we know all sizes).
-    // Fields are all u32 big-endian, 10 fields = 40 bytes.
-    let header_fields: [u32; 10] = [
-        FDT_MAGIC,
-        total_size as u32,
-        struct_table_off as u32, // off_dt_struct
-        string_table_off as u32, // off_dt_strings
-        mem_rsv_off as u32,      // off_mem_rsvmap
-        FDT_VERSION,
-        FDT_COMPAT_VERSION,
-        boot_cpuid_phys,
-        string_table.len() as u32, // size_dt_strings
-        struct_table.len() as u32, // size_dt_struct
-    ];
-    for (i, &field) in header_fields.iter().enumerate() {
-        let off = i * 4;
-        buffer[off..off + 4].copy_from_slice(&field.to_be_bytes());
-    }
-
-    tracing::debug!("cloned boot FDT with patched initrd/cmdline ({total_size} bytes)");
-
-    Ok(())
-}
-
-/// Events produced by flattening the FDT tree.
-enum FdtEvent {
-    /// A node begins (with its name).
-    BeginNode(String),
-    /// A property with its name and data (already patched if needed).
-    Property { name: String, data: Vec<u8> },
-    /// A node ends.
-    EndNode,
-}
-
-/// Flatten an FDT tree into a linear sequence of events using an explicit
-/// stack (iterative DFS), applying property patches along the way.
-fn flatten_fdt_tree(
-    root: &fdt::parser::Node<'_>,
-    patches: &DtPatches<'_>,
-) -> anyhow::Result<Vec<FdtEvent>> {
-    let mut events = Vec::new();
-
-    // Each stack frame tracks a node whose BeginNode + properties have
-    // already been emitted, plus its remaining children to process.
-    struct Frame<'a> {
-        path: String,
-        children: Vec<fdt::parser::Node<'a>>,
-        child_index: usize,
-    }
-
-    // Emit root's BeginNode and properties.
-    events.push(FdtEvent::BeginNode(root.name.to_string()));
-    emit_node_properties(&mut events, root, "", patches)?;
-
-    let root_children: Vec<_> = root
-        .children()
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| anyhow::anyhow!("failed to parse FDT child node: {e}"))?;
-
-    let mut stack = vec![Frame {
-        path: String::new(),
-        children: root_children,
-        child_index: 0,
-    }];
-
-    while let Some(frame) = stack.last_mut() {
-        if frame.child_index < frame.children.len() {
-            let child = &frame.children[frame.child_index];
-            frame.child_index += 1;
-
-            let child_path = if frame.path.is_empty() {
-                child.name.to_string()
-            } else {
-                format!("{}/{}", frame.path, child.name)
-            };
-
-            // Emit this child's BeginNode and properties.
-            events.push(FdtEvent::BeginNode(child.name.to_string()));
-            emit_node_properties(&mut events, child, &child_path, patches)?;
-
-            let grandchildren: Vec<_> = child
-                .children()
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| anyhow::anyhow!("failed to parse FDT child node: {e}"))?;
-
-            stack.push(Frame {
-                path: child_path,
-                children: grandchildren,
-                child_index: 0,
+    // Build memory reservation entries from reserved ranges.
+    let mut memory_reservations = Vec::new();
+    for range in boot_dt_info
+        .config_ranges
+        .iter()
+        .chain(std::iter::once(&boot_dt_info.vtl2_reserved_range))
+        .chain(std::iter::once(&boot_dt_info.vtl2_persisted_header))
+        .chain(std::iter::once(
+            &boot_dt_info.vtl2_persisted_protobuf_region,
+        ))
+        .chain(boot_dt_info.private_pool_ranges.iter().map(|r| &r.range))
+    {
+        if !range.is_empty() {
+            memory_reservations.push(fdt::ReserveEntry {
+                address: range.start().into(),
+                size: range.len().into(),
             });
-        } else {
-            // All children processed; emit EndNode and pop.
-            events.push(FdtEvent::EndNode);
-            stack.pop();
         }
     }
 
-    Ok(events)
-}
+    let builder_config = BuilderConfig {
+        blob_buffer: buffer,
+        string_table_cap: 1024,
+        memory_reservations: &memory_reservations,
+    };
+    let mut builder =
+        Builder::new(builder_config).map_err(|e| anyhow::anyhow!("fdt builder init: {e}"))?;
 
-/// Emit property events for a single node, applying patches for `/chosen`
-/// on aarch64.
-fn emit_node_properties(
-    events: &mut Vec<FdtEvent>,
-    node: &fdt::parser::Node<'_>,
-    node_path: &str,
-    patches: &DtPatches<'_>,
-) -> anyhow::Result<()> {
-    let is_chosen = node_path == "chosen";
+    // Common string IDs.
+    let p_address_cells = builder.add_string("#address-cells").map_err(fdt_err)?;
+    let p_size_cells = builder.add_string("#size-cells").map_err(fdt_err)?;
+    let p_reg = builder.add_string("reg").map_err(fdt_err)?;
+    let p_device_type = builder.add_string("device_type").map_err(fdt_err)?;
+    let p_status = builder.add_string("status").map_err(fdt_err)?;
+    let p_compatible = builder.add_string("compatible").map_err(fdt_err)?;
+    let p_ranges = builder.add_string("ranges").map_err(fdt_err)?;
+    let p_numa_node_id = builder.add_string("numa-node-id").map_err(fdt_err)?;
+    let p_vtl = builder
+        .add_string(igvm_defs::dt::IGVM_DT_VTL_PROPERTY)
+        .map_err(fdt_err)?;
+    let p_vmbus_connection_id = builder
+        .add_string("microsoft,message-connection-id")
+        .map_err(fdt_err)?;
+    let p_dma_coherent = builder.add_string("dma-coherent").map_err(fdt_err)?;
+    let p_igvm_type = builder
+        .add_string(igvm_defs::dt::IGVM_DT_IGVM_TYPE_PROPERTY)
+        .map_err(fdt_err)?;
+    let p_openhcl_memory = builder
+        .add_string("openhcl,memory-type")
+        .map_err(fdt_err)?;
 
-    for prop in node.properties() {
-        let prop = prop.map_err(|e| anyhow::anyhow!("failed to parse FDT property: {e}"))?;
+    #[cfg(target_arch = "aarch64")]
+    let p_interrupt_parent = builder.add_string("interrupt-parent").map_err(fdt_err)?;
+    #[cfg(target_arch = "aarch64")]
+    let p_interrupts = builder.add_string("interrupts").map_err(fdt_err)?;
+    #[cfg(target_arch = "aarch64")]
+    let p_enable_method = builder.add_string("enable-method").map_err(fdt_err)?;
 
-        // On aarch64, patch the /chosen node's initrd and bootargs properties.
-        if cfg!(target_arch = "aarch64") && is_chosen {
-            match prop.name {
-                "bootargs" => {
-                    let mut data = Vec::from(patches.cmdline.as_bytes());
-                    data.push(0);
-                    events.push(FdtEvent::Property {
-                        name: prop.name.to_string(),
-                        data,
-                    });
-                    continue;
+    let _num_cpus = boot_dt_info.cpus.len();
+    #[cfg(target_arch = "aarch64")]
+    let num_cpus = _num_cpus;
+    let bsp_reg = boot_dt_info
+        .cpus
+        .first()
+        .map(|c| c.reg as u32)
+        .unwrap_or(0);
+
+    // -- Root node --
+    let mut root_builder = builder
+        .start_node("")
+        .map_err(fdt_err)?
+        .add_u32(p_address_cells, 2)
+        .map_err(fdt_err)?
+        .add_u32(p_size_cells, 2)
+        .map_err(fdt_err)?
+        .add_str(p_compatible, "microsoft,openvmm")
+        .map_err(fdt_err)?;
+
+    // -- /hypervisor --
+    root_builder = root_builder
+        .start_node("hypervisor")
+        .map_err(fdt_err)?
+        .add_str(p_compatible, "microsoft,hyperv")
+        .map_err(fdt_err)?
+        .end_node()
+        .map_err(fdt_err)?;
+
+    // -- /cpus --
+    let address_cells = if cfg!(target_arch = "aarch64") { 2 } else { 1 };
+    let mut cpu_builder = root_builder
+        .start_node("cpus")
+        .map_err(fdt_err)?
+        .add_u32(p_address_cells, address_cells)
+        .map_err(fdt_err)?
+        .add_u32(p_size_cells, 0)
+        .map_err(fdt_err)?;
+
+    for (vp_index, cpu_entry) in boot_dt_info.cpus.iter().enumerate() {
+        let name = format!("cpu@{}", vp_index + 1);
+
+        let mut cpu = cpu_builder
+            .start_node(&name)
+            .map_err(fdt_err)?
+            .add_str(p_device_type, "cpu")
+            .map_err(fdt_err)?
+            .add_u32(p_numa_node_id, cpu_entry.vnode)
+            .map_err(fdt_err)?;
+
+        if cfg!(target_arch = "aarch64") {
+            #[cfg(target_arch = "aarch64")]
+            {
+                cpu = cpu
+                    .add_u64(p_reg, cpu_entry.reg)
+                    .map_err(fdt_err)?
+                    .add_str(p_compatible, "arm,arm-v8")
+                    .map_err(fdt_err)?;
+
+                if num_cpus > 1 {
+                    cpu = cpu.add_str(p_enable_method, "psci").map_err(fdt_err)?;
                 }
-                "linux,initrd-start" => {
-                    events.push(FdtEvent::Property {
-                        name: prop.name.to_string(),
-                        data: patches.initrd.start.to_be_bytes().to_vec(),
-                    });
-                    continue;
+
+                if vp_index == 0 {
+                    cpu = cpu.add_str(p_status, "okay").map_err(fdt_err)?;
+                } else {
+                    cpu = cpu.add_str(p_status, "disabled").map_err(fdt_err)?;
                 }
-                "linux,initrd-end" => {
-                    events.push(FdtEvent::Property {
-                        name: prop.name.to_string(),
-                        data: patches.initrd.end.to_be_bytes().to_vec(),
-                    });
-                    continue;
-                }
-                _ => {}
+            }
+        } else {
+            cpu = cpu
+                .add_u32(p_reg, cpu_entry.reg as u32)
+                .map_err(fdt_err)?
+                .add_str(p_status, "okay")
+                .map_err(fdt_err)?;
+        }
+
+        cpu_builder = cpu.end_node().map_err(fdt_err)?;
+    }
+    root_builder = cpu_builder.end_node().map_err(fdt_err)?;
+
+    // -- /psci (aarch64 only) --
+    #[cfg(target_arch = "aarch64")]
+    if num_cpus > 1 {
+        let p_method = root_builder.add_string("method").map_err(fdt_err)?;
+        let p_cpu_off = root_builder.add_string("cpu_off").map_err(fdt_err)?;
+        let p_cpu_on = root_builder.add_string("cpu_on").map_err(fdt_err)?;
+        root_builder = root_builder
+            .start_node("psci")
+            .map_err(fdt_err)?
+            .add_str(p_compatible, "arm,psci-0.2")
+            .map_err(fdt_err)?
+            .add_str(p_method, "hvc")
+            .map_err(fdt_err)?
+            .add_u32(p_cpu_off, 1)
+            .map_err(fdt_err)?
+            .add_u32(p_cpu_on, 2)
+            .map_err(fdt_err)?
+            .end_node()
+            .map_err(fdt_err)?;
+    }
+
+    // -- /memory@ nodes for VTL2 RAM --
+    for mem_entry in &boot_dt_info.vtl2_memory {
+        let name = format!("memory@{:x}", mem_entry.range.start());
+        root_builder = root_builder
+            .start_node(&name)
+            .map_err(fdt_err)?
+            .add_str(p_device_type, "memory")
+            .map_err(fdt_err)?
+            .add_u64_array(p_reg, &[mem_entry.range.start(), mem_entry.range.len()])
+            .map_err(fdt_err)?
+            .add_u32(p_numa_node_id, mem_entry.vnode)
+            .map_err(fdt_err)?
+            .end_node()
+            .map_err(fdt_err)?;
+    }
+
+    // -- GIC, timer, PMU (aarch64 only) --
+    #[cfg(target_arch = "aarch64")]
+    {
+        use vm_topology::processor::aarch64::GicInfo;
+
+        const DEFAULT_GIC_DISTRIBUTOR_BASE: u64 = 0xFFFF_0000;
+        const DEFAULT_GIC_REDISTRIBUTORS_BASE: u64 = 0xEFFE_E000;
+        const GIC_PHANDLE: u32 = 1;
+        const GIC_PPI: u32 = 1;
+        const IRQ_TYPE_LEVEL_LOW: u32 = 8;
+        const IRQ_TYPE_LEVEL_HIGH: u32 = 4;
+        const TIMER_INTID: u32 = 4;
+        const PMU_GSIV: u32 = 0x17;
+        const PMU_GSIV_INT_INDEX: u32 = PMU_GSIV - 16;
+
+        let default_gic = GicInfo {
+            gic_distributor_base: DEFAULT_GIC_DISTRIBUTOR_BASE,
+            gic_distributor_size: aarch64defs::GIC_DISTRIBUTOR_SIZE,
+            gic_redistributors_base: DEFAULT_GIC_REDISTRIBUTORS_BASE,
+            gic_redistributors_size: aarch64defs::GIC_REDISTRIBUTOR_SIZE * num_cpus as u64,
+            gic_redistributor_stride: aarch64defs::GIC_REDISTRIBUTOR_SIZE,
+        };
+        let gic = boot_dt_info.gic.as_ref().unwrap_or(&default_gic);
+
+        let p_interrupt_cells = root_builder
+            .add_string("#interrupt-cells")
+            .map_err(fdt_err)?;
+        let p_redist_regions = root_builder
+            .add_string("#redistributor-regions")
+            .map_err(fdt_err)?;
+        let p_redist_stride = root_builder
+            .add_string("redistributor-stride")
+            .map_err(fdt_err)?;
+        let p_interrupt_controller = root_builder
+            .add_string("interrupt-controller")
+            .map_err(fdt_err)?;
+        let p_phandle = root_builder.add_string("phandle").map_err(fdt_err)?;
+        let p_interrupt_names = root_builder
+            .add_string("interrupt-names")
+            .map_err(fdt_err)?;
+        let p_always_on = root_builder.add_string("always-on").map_err(fdt_err)?;
+
+        let name = format!("intc@{}", gic.gic_distributor_base);
+        root_builder = root_builder
+            .start_node(&name)
+            .map_err(fdt_err)?
+            .add_str(p_compatible, "arm,gic-v3")
+            .map_err(fdt_err)?
+            .add_u32(p_redist_regions, 1)
+            .map_err(fdt_err)?
+            .add_u64(p_redist_stride, gic.gic_redistributor_stride)
+            .map_err(fdt_err)?
+            .add_u64_array(
+                p_reg,
+                &[
+                    gic.gic_distributor_base,
+                    gic.gic_distributor_size,
+                    gic.gic_redistributors_base,
+                    gic.gic_redistributors_size,
+                ],
+            )
+            .map_err(fdt_err)?
+            .add_u32(p_address_cells, 2)
+            .map_err(fdt_err)?
+            .add_u32(p_size_cells, 2)
+            .map_err(fdt_err)?
+            .add_u32(p_interrupt_cells, 3)
+            .map_err(fdt_err)?
+            .add_null(p_interrupt_controller)
+            .map_err(fdt_err)?
+            .add_u32(p_phandle, GIC_PHANDLE)
+            .map_err(fdt_err)?
+            .add_null(p_ranges)
+            .map_err(fdt_err)?
+            .end_node()
+            .map_err(fdt_err)?;
+
+        // Timer
+        root_builder = root_builder
+            .start_node("timer")
+            .map_err(fdt_err)?
+            .add_str(p_compatible, "arm,armv8-timer")
+            .map_err(fdt_err)?
+            .add_u32(p_interrupt_parent, GIC_PHANDLE)
+            .map_err(fdt_err)?
+            .add_str(p_interrupt_names, "virt")
+            .map_err(fdt_err)?
+            .add_u32_array(p_interrupts, &[GIC_PPI, TIMER_INTID, IRQ_TYPE_LEVEL_LOW])
+            .map_err(fdt_err)?
+            .add_null(p_always_on)
+            .map_err(fdt_err)?
+            .end_node()
+            .map_err(fdt_err)?;
+
+        // PMU
+        let pmu_gsiv_index = boot_dt_info
+            .pmu_gsiv
+            .map(|gsiv| {
+                assert!(
+                    (16..32).contains(&gsiv),
+                    "PMU GSIV must be a PPI in [16, 32) range"
+                );
+                gsiv - 16
+            })
+            .unwrap_or(PMU_GSIV_INT_INDEX);
+        root_builder = root_builder
+            .start_node("pmu")
+            .map_err(fdt_err)?
+            .add_str(p_compatible, "arm,armv8-pmuv3")
+            .map_err(fdt_err)?
+            .add_u32_array(
+                p_interrupts,
+                &[GIC_PPI, pmu_gsiv_index, IRQ_TYPE_LEVEL_HIGH],
+            )
+            .map_err(fdt_err)?
+            .end_node()
+            .map_err(fdt_err)?;
+    }
+
+    // -- /bus (simple-bus with VMBus) --
+    let vtl2_mmio_ranges: Vec<memory_range::MemoryRange> = boot_dt_info
+        .partition_memory_map
+        .iter()
+        .filter_map(|entry| match entry {
+            AddressRange::Mmio(mmio) if mmio.vtl == bootloader_fdt_parser::Vtl::Vtl2 => {
+                Some(mmio.range)
+            }
+            _ => None,
+        })
+        .collect();
+
+    let mut simple_bus_builder = root_builder
+        .start_node("bus")
+        .map_err(fdt_err)?
+        .add_str(p_compatible, "simple-bus")
+        .map_err(fdt_err)?
+        .add_u32(p_address_cells, 2)
+        .map_err(fdt_err)?
+        .add_u32(p_size_cells, 2)
+        .map_err(fdt_err)?
+        .add_prop_array(p_ranges, &[])
+        .map_err(fdt_err)?;
+
+    // VMBus node
+    {
+        let mut vmbus_builder = simple_bus_builder
+            .start_node("vmbus")
+            .map_err(fdt_err)?
+            .add_u32(p_address_cells, 2)
+            .map_err(fdt_err)?
+            .add_u32(p_size_cells, 2)
+            .map_err(fdt_err)?
+            .add_null(p_dma_coherent)
+            .map_err(fdt_err)?
+            .add_str(p_compatible, "microsoft,vmbus")
+            .map_err(fdt_err)?
+            .add_u32(p_vtl, 2)
+            .map_err(fdt_err)?
+            .add_u32(p_vmbus_connection_id, 4)
+            .map_err(fdt_err)?;
+
+        let mut mmio_values = Vec::new();
+        for entry in &vtl2_mmio_ranges {
+            mmio_values.push(entry.start());
+            mmio_values.push(entry.start());
+            mmio_values.push(entry.len());
+        }
+        vmbus_builder = vmbus_builder
+            .add_u64_array(p_ranges, &mmio_values)
+            .map_err(fdt_err)?;
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            const VMBUS_INTID: u32 = 2;
+            const IRQ_TYPE_EDGE_FALLING: u32 = 2;
+            const GIC_PHANDLE: u32 = 1;
+            const GIC_PPI: u32 = 1;
+            vmbus_builder = vmbus_builder
+                .add_u32(p_interrupt_parent, GIC_PHANDLE)
+                .map_err(fdt_err)?
+                .add_u32_array(
+                    p_interrupts,
+                    &[GIC_PPI, VMBUS_INTID, IRQ_TYPE_EDGE_FALLING],
+                )
+                .map_err(fdt_err)?;
+        }
+
+        simple_bus_builder = vmbus_builder.end_node().map_err(fdt_err)?;
+    }
+
+    root_builder = simple_bus_builder.end_node().map_err(fdt_err)?;
+
+    // -- /chosen (aarch64: bootargs + initrd) --
+    #[cfg(target_arch = "aarch64")]
+    {
+        let p_bootargs = root_builder.add_string("bootargs").map_err(fdt_err)?;
+        let p_initrd_start = root_builder
+            .add_string("linux,initrd-start")
+            .map_err(fdt_err)?;
+        let p_initrd_end = root_builder
+            .add_string("linux,initrd-end")
+            .map_err(fdt_err)?;
+
+        root_builder = root_builder
+            .start_node("chosen")
+            .map_err(fdt_err)?
+            .add_str(p_bootargs, cmdline)
+            .map_err(fdt_err)?
+            .add_u64(p_initrd_start, initrd.start)
+            .map_err(fdt_err)?
+            .add_u64(p_initrd_end, initrd.end)
+            .map_err(fdt_err)?
+            .end_node()
+            .map_err(fdt_err)?;
+    }
+
+    // Suppress unused variable warnings on x86_64.
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = (&initrd, cmdline);
+
+    // -- /openhcl (usermode information) --
+    let mut openhcl_builder = root_builder.start_node("openhcl").map_err(fdt_err)?;
+
+    // Isolation type
+    let p_isolation_type = openhcl_builder
+        .add_string("isolation-type")
+        .map_err(fdt_err)?;
+    let isolation_str = match boot_dt_info.isolation {
+        bootloader_fdt_parser::IsolationType::None => "none",
+        bootloader_fdt_parser::IsolationType::Vbs => "vbs",
+        bootloader_fdt_parser::IsolationType::Snp => "snp",
+        bootloader_fdt_parser::IsolationType::Tdx => "tdx",
+    };
+    openhcl_builder = openhcl_builder
+        .add_str(p_isolation_type, isolation_str)
+        .map_err(fdt_err)?;
+
+    // Memory allocation mode
+    let p_memory_allocation_mode = openhcl_builder
+        .add_string("memory-allocation-mode")
+        .map_err(fdt_err)?;
+    match boot_dt_info.memory_allocation_mode {
+        bootloader_fdt_parser::MemoryAllocationMode::Host => {
+            openhcl_builder = openhcl_builder
+                .add_str(p_memory_allocation_mode, "host")
+                .map_err(fdt_err)?;
+        }
+        bootloader_fdt_parser::MemoryAllocationMode::Vtl2 {
+            memory_size,
+            mmio_size,
+        } => {
+            let p_memory_size = openhcl_builder.add_string("memory-size").map_err(fdt_err)?;
+            let p_mmio_size = openhcl_builder.add_string("mmio-size").map_err(fdt_err)?;
+            openhcl_builder = openhcl_builder
+                .add_str(p_memory_allocation_mode, "vtl2")
+                .map_err(fdt_err)?;
+            if let Some(memory_size) = memory_size {
+                openhcl_builder = openhcl_builder
+                    .add_u64(p_memory_size, memory_size)
+                    .map_err(fdt_err)?;
+            }
+            if let Some(mmio_size) = mmio_size {
+                openhcl_builder = openhcl_builder
+                    .add_u64(p_mmio_size, mmio_size)
+                    .map_err(fdt_err)?;
             }
         }
-
-        // Default: copy property data verbatim.
-        events.push(FdtEvent::Property {
-            name: prop.name.to_string(),
-            data: prop.data.to_vec(),
-        });
     }
 
+    // VTL0 alias map
+    if let Some(alias_map) = boot_dt_info.vtl0_alias_map {
+        let p_vtl0_alias_map = openhcl_builder
+            .add_string("vtl0-alias-map")
+            .map_err(fdt_err)?;
+        openhcl_builder = openhcl_builder
+            .add_u64(p_vtl0_alias_map, alias_map)
+            .map_err(fdt_err)?;
+    }
+
+    // Unified partition memory map.
+    let memory_openhcl_type = "memory-openhcl";
+    for entry in &boot_dt_info.partition_memory_map {
+        match entry {
+            AddressRange::Memory(mem) => {
+                let name = format!("memory@{:x}", mem.range.range.start());
+                openhcl_builder = openhcl_builder
+                    .start_node(&name)
+                    .map_err(fdt_err)?
+                    .add_str(p_device_type, memory_openhcl_type)
+                    .map_err(fdt_err)?
+                    .add_u64_array(
+                        p_reg,
+                        &[mem.range.range.start(), mem.range.range.len()],
+                    )
+                    .map_err(fdt_err)?
+                    .add_u32(p_numa_node_id, mem.range.vnode)
+                    .map_err(fdt_err)?
+                    .add_u32(p_igvm_type, mem.igvm_type.0.into())
+                    .map_err(fdt_err)?
+                    .add_u32(p_openhcl_memory, mem.vtl_usage.0)
+                    .map_err(fdt_err)?
+                    .end_node()
+                    .map_err(fdt_err)?;
+            }
+            AddressRange::Mmio(mmio) => {
+                let name = format!("memory@{:x}", mmio.range.start());
+                let vtl_type = match mmio.vtl {
+                    bootloader_fdt_parser::Vtl::Vtl0 => {
+                        loader_defs::shim::MemoryVtlType::VTL0_MMIO
+                    }
+                    bootloader_fdt_parser::Vtl::Vtl2 => {
+                        loader_defs::shim::MemoryVtlType::VTL2_MMIO
+                    }
+                };
+                openhcl_builder = openhcl_builder
+                    .start_node(&name)
+                    .map_err(fdt_err)?
+                    .add_str(p_device_type, memory_openhcl_type)
+                    .map_err(fdt_err)?
+                    .add_u64_array(p_reg, &[mmio.range.start(), mmio.range.len()])
+                    .map_err(fdt_err)?
+                    .add_u32(p_openhcl_memory, vtl_type.0)
+                    .map_err(fdt_err)?
+                    .end_node()
+                    .map_err(fdt_err)?;
+            }
+        }
+    }
+
+    // Accepted memory ranges
+    for range in &boot_dt_info.accepted_ranges {
+        let name = format!("accepted-memory@{:x}", range.start());
+        openhcl_builder = openhcl_builder
+            .start_node(&name)
+            .map_err(fdt_err)?
+            .add_u64_array(p_reg, &[range.start(), range.len()])
+            .map_err(fdt_err)?
+            .end_node()
+            .map_err(fdt_err)?;
+    }
+
+    root_builder = openhcl_builder.end_node().map_err(fdt_err)?;
+
+    root_builder
+        .end_node()
+        .map_err(fdt_err)?
+        .build(bsp_reg)
+        .map_err(fdt_err)?;
+
     Ok(())
+}
+
+/// Helper to convert FDT builder errors into anyhow errors.
+fn fdt_err(e: fdt::builder::Error) -> anyhow::Error {
+    anyhow::anyhow!("fdt builder error: {e}")
 }
