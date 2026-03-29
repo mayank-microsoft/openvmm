@@ -218,66 +218,6 @@ fn align_up(addr: u64, alignment: u64) -> u64 {
     (addr + alignment - 1) & !(alignment - 1)
 }
 
-/// Build an x86_64 trampoline code stub.
-///
-/// After kexec's `relocate_kernel` runs, the CPU is in 64-bit long mode
-/// with identity-mapped paging, but many control/debug/segment registers
-/// may still carry stale state from the old kernel. This trampoline
-/// provides the new kernel with a clean environment matching what
-/// `startup_64` expects.
-///
-/// The generated machine code performs the following:
-/// ```text
-///   ; --- Phase 1: Diagnostic output ---
-///   ;   Emit "KEXEC\r\n" to COM3 (I/O 0x3E8) so we can confirm entry
-///   ;   even if later phases crash. (see emit_serial_char)
-///
-///   ; --- Phase 2: CPU state cleanup ---
-///   cli                        ; disable maskable interrupts
-///   cld                        ; clear direction flag
-///   mov  al, 0x80
-///   out  0x70, al              ; disable NMI via CMOS port
-///
-///   mov  eax, 0x20             ; CR4 = PAE only (bit 5)
-///   mov  cr4, rax              ; clears SMEP/SMAP/UMIP/PCIDE/…
-///   mov  eax, 0x80010033       ; CR0 = PG|WP|NE|ET|MP|PE
-///   mov  cr0, rax              ; clears CD/NW
-///   mov  rax, cr3
-///   mov  cr3, rax              ; flush TLB
-///
-///   xor  eax, eax              ; zero for debug + segment regs
-///   mov  dr0, rax              ; clear hardware breakpoints
-///   mov  dr1, rax
-///   mov  dr2, rax
-///   mov  dr3, rax
-///   mov  dr6, rax              ; clear debug status
-///   mov  dr7, rax              ; disable all hw breakpoints
-///
-///   mov  ds, ax                ; null-out data segments
-///   mov  es, ax
-///   mov  ss, ax
-///   mov  fs, ax
-///   mov  gs, ax
-///
-///   ; --- Phase 3: Clear general-purpose registers ---
-///   xor  ecx/edx/ebx/ebp/esp, ...   ; zero all GPRs
-///   xor  r8d..r15d, ...
-///
-///   ; --- Phase 4: Boot protocol setup + jump ---
-///   xor  edi, edi              ; RDI = 0
-///   mov  rsi, <boot_params>    ; RSI = boot_params phys addr
-///   mov  rax, <entry_point>    ; kernel entry point
-///   jmp  rax
-/// ```
-///
-/// The COM3 output provides early evidence that the trampoline executed,
-/// visible via `ohcldiag-dev` serial or the Hyper-V COM3 pipe.
-///
-/// The Linux 64-bit boot protocol expects:
-/// - RSI → pointer to the `boot_params` (zero page)
-/// - RDI → 0
-///
-/// Returns the raw machine code bytes.
 /// Build identity-mapped 4-level page tables using 2MB pages.
 ///
 /// Covers physical addresses from 0 to `max_phys_addr`, providing the
@@ -338,6 +278,23 @@ fn build_identity_page_tables(base_phys: u64, max_phys_addr: u64) -> Vec<u8> {
     buf
 }
 
+/// Build an x86_64 trampoline code stub.
+///
+/// After kexec's `relocate_kernel` runs, the CPU is in 64-bit long mode
+/// with identity-mapped paging, but many control/debug/segment registers
+/// may still carry stale state from the old kernel. This trampoline
+/// provides the new kernel with a clean environment matching what
+/// `startup_64` expects.
+///
+/// The generated machine code:
+/// 1. Disables interrupts and NMI
+/// 2. Sets CR4 = PAE, CR0 = PG|WP|NE|ET|MP|PE
+/// 3. Loads identity-mapped page tables into CR3
+/// 4. Clears debug registers (DR0-DR3, DR6, DR7)
+/// 5. Loads a GDT with __BOOT_CS (0x10) and __BOOT_DS (0x18)
+/// 6. Sets CS/DS/ES/SS per the 64-bit boot protocol
+/// 7. Zeros all general-purpose registers
+/// 8. Sets RDI=0, RSI=boot_params, RAX=entry and jumps to kernel
 #[cfg(target_arch = "x86_64")]
 fn build_x86_64_trampoline(boot_params_phys: u64, kernel_entry: u64, page_table_phys: u64) -> Vec<u8> {
     let mut code = Vec::with_capacity(256);
@@ -347,47 +304,7 @@ fn build_x86_64_trampoline(boot_params_phys: u64, kernel_entry: u64, page_table_
     //
     // For each character the sequence is:
     //   mov dx, 0x3ED        ; LSR (COM3 + 5)
-    //   .wait:
-    //   in  al, dx           ; read LSR
-    //   test al, 0x20        ; THRE bit set?
-    //   jz  .wait            ; no → spin
-    //   mov dx, 0x3E8        ; COM3 data register
-    //   mov al, <char>
-    //   out dx, al
-    fn emit_serial_char(code: &mut Vec<u8>, ch: u8) {
-        // mov dx, 0x3ED  =>  66 BA ED 03
-        code.extend_from_slice(&[0x66, 0xBA, 0xED, 0x03]);
-
-        // .wait:  (offset of 'in al, dx')
-        // in al, dx  =>  EC
-        code.push(0xEC);
-
-        // test al, 0x20  =>  A8 20
-        code.extend_from_slice(&[0xA8, 0x20]);
-
-        // jz .wait  (jump back 4 bytes: offset = -4 = 0xFC)
-        //   jz rel8  =>  74 FC
-        code.extend_from_slice(&[0x74, 0xFC]);
-
-        // mov dx, 0x3E8  =>  66 BA E8 03
-        code.extend_from_slice(&[0x66, 0xBA, 0xE8, 0x03]);
-
-        // mov al, <ch>  =>  B0 <ch>
-        code.extend_from_slice(&[0xB0, ch]);
-
-        // out dx, al  =>  EE
-        code.push(0xEE);
-    }
-
-    // ---- Phase 1: Diagnostic output ----------------------------------------
-    //
-    // Emit "KEXEC\r\n" to COM3 so we can confirm the trampoline ran, even
-    // if the CPU state cleanup below triggers a fault.
-    for &ch in b"KEXEC\r\n" {
-        emit_serial_char(&mut code, ch);
-    }
-
-    // ---- Phase 2: CPU state cleanup ----------------------------------------
+    // ---- CPU state cleanup -------------------------------------------------
     //
     // The old kernel's machine_kexec copied our segments to their final
     // physical addresses and jumped here with identity-mapped paging, but
@@ -428,8 +345,6 @@ fn build_x86_64_trampoline(boot_params_phys: u64, kernel_entry: u64, page_table_
     code.extend_from_slice(&[0xB8, 0x33, 0x00, 0x01, 0x80]);
     code.extend_from_slice(&[0x0F, 0x22, 0xC0]);
 
-    emit_serial_char(&mut code, b'P'); // before CR3 load
-
     // Load our identity-mapped page tables into CR3.
     //   movabs rax, <page_table_phys>  =>  48 B8 <imm64>
     //   mov cr3, rax                   =>  0F 22 D8
@@ -437,8 +352,6 @@ fn build_x86_64_trampoline(boot_params_phys: u64, kernel_entry: u64, page_table_
     code.push(0xB8);
     code.extend_from_slice(&page_table_phys.to_le_bytes());
     code.extend_from_slice(&[0x0F, 0x22, 0xD8]);
-
-    emit_serial_char(&mut code, b'C'); // CR3 load succeeded
 
     // Clear all debug registers to remove stale hardware breakpoints and
     // watchpoints from the old kernel.
@@ -510,8 +423,6 @@ fn build_x86_64_trampoline(boot_params_phys: u64, kernel_entry: u64, page_table_
     // add rsp, 16  => 48 83 C4 10
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x10]);
 
-    emit_serial_char(&mut code, b'G'); // GDT loaded
-
     // Load segment selectors per 64-bit boot protocol:
     // DS = ES = SS = __BOOT_DS (0x18)
     //   mov ax, 0x18  =>  66 B8 18 00
@@ -548,7 +459,7 @@ fn build_x86_64_trampoline(boot_params_phys: u64, kernel_entry: u64, page_table_
     code[cs_reload_lea_pos + 3..cs_reload_lea_pos + 7]
         .copy_from_slice(&cs_rel.to_le_bytes());
 
-    // ---- Phase 3: Clear general-purpose registers --------------------------
+    // ---- Clear general-purpose registers ------------------------------------
     //
     // Zero all GPRs so the kernel doesn't see stale values from the old
     // kernel's context. RSI and RDI are set in phase 4.
@@ -581,9 +492,7 @@ fn build_x86_64_trampoline(boot_params_phys: u64, kernel_entry: u64, page_table_
     //   xor r15d, r15d  =>  45 31 FF
     code.extend_from_slice(&[0x45, 0x31, 0xFF]);
 
-    emit_serial_char(&mut code, 'x' as u8); // emit 'x' to indicate CPU state cleanup is done
-    emit_serial_char(&mut code, '\n' as u8);
-    // ---- Phase 4: Set up boot protocol registers and jump ------------------
+    // ---- Set up boot protocol registers and jump ----------------------------
 
     // xor edi, edi  =>  31 FF
     code.extend_from_slice(&[0x31, 0xFF]);
@@ -597,19 +506,6 @@ fn build_x86_64_trampoline(boot_params_phys: u64, kernel_entry: u64, page_table_
     code.push(0x48);
     code.push(0xB8);
     code.extend_from_slice(&kernel_entry.to_le_bytes());
-
-    // Minimal verification: read one byte from kernel entry, then
-    // print 'V' to confirm the read succeeded (no crash).
-    //   movabs rax, <kernel_entry>  =>  48 B8 <imm64>
-    code.push(0x48);
-    code.push(0xB8);
-    code.extend_from_slice(&kernel_entry.to_le_bytes());
-    //   movzx eax, byte [rax]  =>  0F B6 00
-    code.extend_from_slice(&[0x0F, 0xB6, 0x00]);
-
-    emit_serial_char(&mut code, b'V'); // verified: memory read OK
-
-    emit_serial_char(&mut code, b'J'); // about to jump to kernel
 
     // jmp rax  =>  FF E0
     code.extend_from_slice(&[0xFF, 0xE0]);
