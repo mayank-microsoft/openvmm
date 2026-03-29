@@ -627,13 +627,25 @@ fn prepare_x86_64(
         "using VTL2 RAM range for kexec segment placement"
     );
 
-    // Build kexec segments for each ELF PT_LOAD, loading at p_paddr.
-    let mut kernel_segments = Vec::new();
-    let mut highest_seg_end: u64 = 0;
-    for seg in &vmlinux_info.segments {
-        let seg_memsz = align_up(seg.mem_size, PAGE_SIZE) as usize;
+    // Build a single contiguous kernel blob covering all ELF PT_LOAD segments.
+    // Each segment's file data is placed at (seg.paddr - lowest_paddr) within
+    // the blob, with gaps and BSS regions zero-filled.
+    let lowest_paddr = vmlinux_info
+        .segments
+        .iter()
+        .map(|s| s.paddr)
+        .min()
+        .unwrap();
+    let highest_seg_end = vmlinux_info
+        .segments
+        .iter()
+        .map(|s| s.paddr + align_up(s.mem_size, PAGE_SIZE))
+        .max()
+        .unwrap();
+    let kernel_blob_size = align_up(highest_seg_end - lowest_paddr, PAGE_SIZE) as usize;
 
-        // Extract the segment data from the raw ELF file.
+    let mut kernel_blob = vec![0u8; kernel_blob_size];
+    for seg in &vmlinux_info.segments {
         let file_start = seg.file_offset as usize;
         let file_end = file_start + seg.file_size as usize;
         anyhow::ensure!(
@@ -644,25 +656,18 @@ fn prepare_x86_64(
             data.vmlinux.len()
         );
 
-        // Build the segment data: file contents + zero-fill for BSS.
-        let mut seg_data = data.vmlinux[file_start..file_end].to_vec();
-        if seg.mem_size > seg.file_size {
-            seg_data.resize(seg.mem_size as usize, 0);
-        }
-
-        let seg_end = seg.paddr + seg_memsz as u64;
-        if seg_end > highest_seg_end {
-            highest_seg_end = seg_end;
-        }
-
-        kernel_segments.push(KexecSegment {
-            data: seg_data,
-            phys_addr: seg.paddr,
-            mem_size: seg_memsz,
-        });
+        let blob_offset = (seg.paddr - lowest_paddr) as usize;
+        kernel_blob[blob_offset..blob_offset + seg.file_size as usize]
+            .copy_from_slice(&data.vmlinux[file_start..file_end]);
     }
 
-    // Place auxiliary segments after the kernel's highest segment.
+    tracing::info!(
+        kernel_load_phys = %format_args!("{:#x}", lowest_paddr),
+        kernel_blob_size = %format_args!("{:#x}", kernel_blob_size),
+        "loading vmlinux as single contiguous blob"
+    );
+
+    // Place auxiliary segments after the kernel blob.
     let mut next_addr = align_up(highest_seg_end, PAGE_SIZE);
 
     // Trampoline
@@ -751,15 +756,19 @@ fn prepare_x86_64(
     // -- 5. Assemble segments ------------------------------------------------
     //
     // The trampoline is the first segment and its physical address is the
-    // kexec entry point. Kernel ELF segments follow.
+    // kexec entry point. The kernel is a single contiguous blob.
     let mut segments = vec![KexecSegment {
         data: trampoline_buf,
         phys_addr: trampoline_phys,
         mem_size: trampoline_memsz,
     }];
 
-    // Add all kernel ELF PT_LOAD segments.
-    segments.extend(kernel_segments);
+    // Add the single kernel blob.
+    segments.push(KexecSegment {
+        data: kernel_blob,
+        phys_addr: lowest_paddr,
+        mem_size: kernel_blob_size,
+    });
 
     // Add initrd, cmdline, FDT, and boot_params.
     segments.push(KexecSegment {
