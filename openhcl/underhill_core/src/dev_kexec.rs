@@ -736,37 +736,38 @@ fn prepare_x86_64(
     );
 
     // Place auxiliary segments after the relocated kernel blob.
+    //
+    // CRITICAL: The kernel's __startup_64 creates an identity mapping that
+    // only covers ~14MB around kernel_load_phys (_end - _text rounded up
+    // to 2MB). boot_params, cmdline, FDT, and page tables MUST be placed
+    // within this region so the kernel can access them after switching to
+    // its own page tables. The large initrd goes last — it's accessed
+    // later when the kernel has full page tables set up.
     let mut next_addr = align_up(kernel_load_phys + kernel_blob_size as u64, PAGE_SIZE);
 
-    // Trampoline
+    // Trampoline (must be before initrd — small, within identity map)
     let trampoline_phys = next_addr;
     let trampoline_memsz = PAGE_SIZE as usize;
     next_addr += trampoline_memsz as u64;
 
-    // Initrd
-    let initrd_phys = align_up(next_addr, PAGE_SIZE);
-    let initrd_size = data.initrd.len() as u64;
-    let initrd_memsz = align_up(initrd_size, PAGE_SIZE) as usize;
-    next_addr = initrd_phys + initrd_memsz as u64;
-
-    // Command line (null-terminated)
+    // Command line (null-terminated) — small, within identity map
     let cmdline_phys = next_addr;
     let mut cmdline_buf = data.command_line.as_bytes().to_vec();
     cmdline_buf.push(0); // null-terminate
     let cmdline_memsz = align_up(cmdline_buf.len() as u64, PAGE_SIZE) as usize;
     next_addr += cmdline_memsz as u64;
 
-    // FDT (with setup_data header prepended)
+    // FDT (with setup_data header prepended) — within identity map
     let fdt_phys = next_addr;
     let fdt_memsz = align_up(FDT_SIZE as u64, PAGE_SIZE) as usize;
     next_addr += fdt_memsz as u64;
 
-    // boot_params (one page)
+    // boot_params (one page) — MUST be within identity map
     let boot_params_phys = next_addr;
     let boot_params_memsz = PAGE_SIZE as usize;
     next_addr += boot_params_memsz as u64;
 
-    // Identity-mapped page tables (2MB pages covering all VTL2 memory).
+    // Identity-mapped page tables — within identity map
     let max_phys_addr = boot_dt_info
         .vtl2_memory
         .iter()
@@ -778,6 +779,14 @@ fn prepare_x86_64(
     let page_table_pages = 2 + num_pt_gb; // PML4 + PDPT + PD pages
     let page_table_memsz = page_table_pages * PAGE_SIZE as usize;
     next_addr += page_table_memsz as u64;
+
+    // Initrd — large (~63MB), placed last. The kernel reads the initrd
+    // address from boot_params but doesn't access the data until later
+    // when full page tables are set up.
+    let initrd_phys = align_up(next_addr, PAGE_SIZE);
+    let initrd_size = data.initrd.len() as u64;
+    let initrd_memsz = align_up(initrd_size, PAGE_SIZE) as usize;
+    next_addr = initrd_phys + initrd_memsz as u64;
 
     // Verify everything fits in the RAM range.
     anyhow::ensure!(
