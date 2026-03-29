@@ -597,9 +597,7 @@ fn prepare_x86_64(
         "ELF vmlinux has no PT_LOAD segments"
     );
 
-    // OpenHCL runs identity-mapped (vaddr == paddr), so e_entry is already
-    // the physical entry point.
-    let mut kernel_entry_phys = vmlinux_info.entry_point;
+    const PHYSICAL_ALIGN: u64 = 2 * 1024 * 1024; // 2 MB
 
     for seg in &vmlinux_info.segments {
         tracing::info!(
@@ -612,20 +610,17 @@ fn prepare_x86_64(
         );
     }
 
-    // -- 1. Determine physical addresses for each segment --------------------
+    // -- 1. Find usable RAM and lay out all segments sequentially -------------
     //
-    // During kexec, the kernel copies segments to the specified physical
-    // addresses. For relocatable kernels (CONFIG_RELOCATABLE=y), the ELF
-    // p_paddr values may point outside the VTL2 RAM range (e.g. at
-    // 0x0800_0000 which is inside VTL0 guest RAM). Loading there would
-    // corrupt guest memory. Detect this case and rebase all segments
-    // into the VTL2 RAM range, aligned to PHYSICAL_ALIGN (2 MB).
+    // Instead of using the ELF p_paddr values (which may point into VTL0
+    // guest RAM), we place ALL segments linearly into the largest
+    // contiguous System RAM region. The kernel must have
+    // CONFIG_RELOCATABLE=y so it can boot from any 2 MB-aligned address.
+    //
+    // Layout (packed sequentially, each page-aligned):
+    //   [kernel seg 0] [kernel seg 1] ... [kernel seg N]
+    //   [trampoline] [initrd] [cmdline] [FDT] [boot_params]
 
-    // Use the actual System RAM ranges from /proc/iomem rather than the
-    // device-tree VTL2 range. The DT range may include a small reserved
-    // region at the base that is not marked as System RAM in the e820 map.
-    // Placing the kernel there causes the new kernel to remove its own
-    // .text from the memory map ("not marked as E820_TYPE_RAM!").
     let usable_ram = find_largest_system_ram()
         .context("finding System RAM for kexec placement")?;
 
@@ -636,55 +631,12 @@ fn prepare_x86_64(
         "using System RAM range from /proc/iomem for kexec segment placement"
     );
 
-    // Compute relocation delta if kernel segments fall outside VTL2 RAM.
-    //
-    // When the lowest ELF p_paddr is below the VTL2 range start, we
-    // relocate the entire kernel so its lowest segment begins at a
-    // 2 MB-aligned address within VTL2 RAM. The kernel must be built
-    // with CONFIG_RELOCATABLE=y for this to work correctly.
-    const PHYSICAL_ALIGN: u64 = 2 * 1024 * 1024; // 2 MB
+    // Start at a 2 MB-aligned address within the RAM range.
+    let kernel_load_phys = align_up(usable_ram.start, PHYSICAL_ALIGN);
+    let mut next_addr = kernel_load_phys;
 
-    let lowest_seg_paddr = vmlinux_info
-        .segments
-        .iter()
-        .map(|s| s.paddr)
-        .min()
-        .unwrap(); // safe: ensured non-empty above
-
-    let reloc_delta: i64 = if lowest_seg_paddr < usable_ram.start
-        || vmlinux_info.segments.iter().any(|s| {
-            s.paddr + align_up(s.mem_size, PAGE_SIZE) > usable_ram.end
-        })
-    {
-        // Segments fall outside VTL2 RAM — relocate into the range.
-        let new_base = align_up(usable_ram.start, PHYSICAL_ALIGN);
-        let delta = new_base as i64 - lowest_seg_paddr as i64;
-        tracing::warn!(
-            lowest_seg_paddr = %format_args!("{:#x}", lowest_seg_paddr),
-            vtl2_range_start = %format_args!("{:#x}", usable_ram.start),
-            new_base = %format_args!("{:#x}", new_base),
-            delta = %format_args!("{:#x}", delta),
-            "kernel segments outside VTL2 RAM, relocating"
-        );
-        delta
-    } else {
-        0
-    };
-
-    // Apply relocation to the entry point.
-    if reloc_delta != 0 {
-        let old_entry = kernel_entry_phys;
-        kernel_entry_phys = (kernel_entry_phys as i64 + reloc_delta) as u64;
-        tracing::info!(
-            old_entry = %format_args!("{:#x}", old_entry),
-            new_entry = %format_args!("{:#x}", kernel_entry_phys),
-            "relocated kernel entry point"
-        );
-    }
-
-    // Build kexec segments for each ELF PT_LOAD, applying relocation.
+    // Build kexec segments for each ELF PT_LOAD, placed sequentially.
     let mut kernel_segments = Vec::new();
-    let mut highest_seg_end: u64 = 0;
     for seg in &vmlinux_info.segments {
         let seg_memsz = align_up(seg.mem_size, PAGE_SIZE) as usize;
 
@@ -705,67 +657,56 @@ fn prepare_x86_64(
             seg_data.resize(seg.mem_size as usize, 0);
         }
 
-        let relocated_paddr = (seg.paddr as i64 + reloc_delta) as u64;
-        let seg_end = relocated_paddr + seg_memsz as u64;
-        if seg_end > highest_seg_end {
-            highest_seg_end = seg_end;
-        }
+        let seg_phys = next_addr;
+        next_addr += seg_memsz as u64;
 
-        if reloc_delta != 0 {
-            tracing::info!(
-                original = %format_args!("{:#x}", seg.paddr),
-                relocated = %format_args!("{:#x}", relocated_paddr),
-                "relocated ELF segment"
-            );
-        }
+        tracing::info!(
+            original_paddr = %format_args!("{:#x}", seg.paddr),
+            placed_at = %format_args!("{:#x}", seg_phys),
+            mem_size = %format_args!("{:#x}", seg_memsz),
+            "placed ELF segment"
+        );
 
         kernel_segments.push(KexecSegment {
             data: seg_data,
-            phys_addr: relocated_paddr,
+            phys_addr: seg_phys,
             mem_size: seg_memsz,
         });
     }
 
-    // Verify all relocated segments are within VTL2 RAM.
-    for kseg in &kernel_segments {
-        let seg_end = kseg.phys_addr + kseg.mem_size as u64;
-        anyhow::ensure!(
-            kseg.phys_addr >= usable_ram.start && seg_end <= usable_ram.end,
-            "relocated kernel segment [{:#x}..{:#x}) outside VTL2 RAM [{:#x}..{:#x})",
-            kseg.phys_addr,
-            seg_end,
-            usable_ram.start,
-            usable_ram.end
-        );
-    }
-
-    // Compute the kernel physical load base (lowest relocated segment address).
-    // This is needed for boot_params.hdr.pref_address and init_size so the
-    // new kernel reserves this memory and does not overwrite its own code.
-    let kernel_load_phys = kernel_segments
+    // Compute the kernel entry point: offset from lowest original p_paddr
+    // applied to our load base.
+    let lowest_seg_paddr = vmlinux_info
+        .segments
         .iter()
-        .map(|s| s.phys_addr)
+        .map(|s| s.paddr)
         .min()
         .unwrap();
-
-    // Place auxiliary segments after the kernel's highest segment.
-    let mut next_addr = align_up(highest_seg_end, PAGE_SIZE);
+    let kernel_entry_phys = kernel_load_phys + (vmlinux_info.entry_point - lowest_seg_paddr);
+    tracing::info!(
+        original_entry = %format_args!("{:#x}", vmlinux_info.entry_point),
+        kernel_entry_phys = %format_args!("{:#x}", kernel_entry_phys),
+        kernel_load_phys = %format_args!("{:#x}", kernel_load_phys),
+        "kernel entry point"
+    );
 
     // Trampoline
+    next_addr = align_up(next_addr, PAGE_SIZE);
     let trampoline_phys = next_addr;
     let trampoline_memsz = PAGE_SIZE as usize;
     next_addr += trampoline_memsz as u64;
 
     // Initrd
-    let initrd_phys = align_up(next_addr, PAGE_SIZE);
+    next_addr = align_up(next_addr, PAGE_SIZE);
+    let initrd_phys = next_addr;
     let initrd_size = data.initrd.len() as u64;
     let initrd_memsz = align_up(initrd_size, PAGE_SIZE) as usize;
-    next_addr = initrd_phys + initrd_memsz as u64;
+    next_addr += initrd_memsz as u64;
 
     // Command line (null-terminated)
     let cmdline_phys = next_addr;
     let mut cmdline_buf = data.command_line.as_bytes().to_vec();
-    cmdline_buf.push(0); // null-terminate
+    cmdline_buf.push(0);
     let cmdline_memsz = align_up(cmdline_buf.len() as u64, PAGE_SIZE) as usize;
     next_addr += cmdline_memsz as u64;
 
@@ -782,24 +723,24 @@ fn prepare_x86_64(
     // Verify everything fits in the RAM range.
     anyhow::ensure!(
         next_addr <= usable_ram.end,
-        "kexec segments ({:#x} bytes) exceed VTL2 RAM range (ends at {:#x})",
-        next_addr - usable_ram.start,
-        usable_ram.end
+        "kexec segments [{:#x}..{:#x}) ({:#x} bytes) do not fit in System RAM [{:#x}..{:#x})",
+        kernel_load_phys,
+        next_addr,
+        next_addr - kernel_load_phys,
+        usable_ram.start,
+        usable_ram.end,
     );
 
     // -- 2. Build the device tree --------------------------------------------
     let mut fdt = Fdt {
         header: setup_data {
-            next: 0, // no further setup_data nodes
+            next: 0,
             ty: SETUP_DTB,
             len: (FDT_SIZE - size_of::<setup_data>()) as u32,
         },
         data: [0u8; FDT_SIZE - size_of::<setup_data>()],
     };
 
-    // Clone the boot FDT into the data portion (after the setup_data
-    // header). On x86_64, initrd and cmdline are passed via boot_params,
-    // not via the FDT, so the tree is cloned verbatim.
     clone_and_patch_device_tree(
         &mut fdt.data,
         initrd_phys..initrd_phys + initrd_size,
@@ -824,10 +765,6 @@ fn prepare_x86_64(
     let boot_params_buf = bp.as_bytes().to_vec();
 
     // -- 4. Build the trampoline ---------------------------------------------
-    //
-    // The trampoline sets up the register state that the Linux 64-bit boot
-    // protocol requires (RSI = &boot_params, RDI = 0) and then jumps to the
-    // real kernel entry point.
     let trampoline_buf = build_x86_64_trampoline(boot_params_phys, kernel_entry_phys);
 
     tracing::info!(
@@ -838,19 +775,14 @@ fn prepare_x86_64(
     );
 
     // -- 5. Assemble segments ------------------------------------------------
-    //
-    // The trampoline is the first segment and its physical address is the
-    // kexec entry point. Kernel ELF segments follow.
     let mut segments = vec![KexecSegment {
         data: trampoline_buf,
         phys_addr: trampoline_phys,
         mem_size: trampoline_memsz,
     }];
 
-    // Add all kernel ELF PT_LOAD segments.
     segments.extend(kernel_segments);
 
-    // Add initrd, cmdline, FDT, and boot_params.
     segments.push(KexecSegment {
         data: data.initrd,
         phys_addr: initrd_phys,
