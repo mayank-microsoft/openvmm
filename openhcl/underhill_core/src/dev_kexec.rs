@@ -938,13 +938,10 @@ fn prepare_x86_64(
     let fdt_buf = fdt.as_bytes().to_vec();
 
     // -- 3. Build boot_params (zero page) ------------------------------------
-    let kernel_init_size = align_up(highest_seg_end - kernel_load_phys, 0x200000);
     let bp = build_boot_params(
         initrd_phys..initrd_phys + initrd_size,
         cmdline_phys,
         fdt_phys,
-        kernel_load_phys,
-        kernel_init_size,
     )
     .context("failed to build boot_params")?;
 
@@ -984,7 +981,7 @@ fn prepare_x86_64(
     // carries only the file data (p_filesz); the kexec mechanism
     // zero-fills up to mem_size, which handles BSS regions.
     for seg in &vmlinux_info.segments {
-        let seg_phys = seg.paddr + load_offset;
+        let seg_phys: u64 = seg.paddr + load_offset;
         let file_start = seg.file_offset as usize;
         let file_end = file_start + seg.file_size as usize;
         let seg_data = data.vmlinux[file_start..file_end].to_vec();
@@ -1033,8 +1030,6 @@ fn build_boot_params(
     initrd: std::ops::Range<u64>,
     cmdline_phys: u64,
     setup_data_phys: u64,
-    kernel_load_phys: u64,
-    kernel_init_size: u64,
 ) -> anyhow::Result<loader_defs::linux::boot_params> {
     use loader_defs::linux::boot_params;
     use zerocopy::FromZeros;
@@ -1059,13 +1054,9 @@ fn build_boot_params(
 
     bp.hdr.setup_data = setup_data_phys.into();
 
-    // Per the 64-bit boot protocol, init_size tells the kernel how much
-    // memory to reserve from the load address. pref_address indicates where
-    // the kernel was loaded.
-    bp.hdr.pref_address = kernel_load_phys.into();
-    bp.hdr.init_size = (kernel_init_size as u32).into();
-    bp.hdr.relocatable_kernel = 1;
-    bp.hdr.kernel_alignment = 0x200000u32.into(); // 2MB
+    // NOTE: openhcl_boot does NOT set pref_address, init_size,
+    // relocatable_kernel, or kernel_alignment -- leave them as zero
+    // to match the working first-boot path.
 
     build_e820_map(&mut bp)?;
 
