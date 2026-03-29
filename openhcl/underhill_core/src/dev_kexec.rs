@@ -16,8 +16,10 @@
 //!    boot_params physical address, clears RDI, and jumps to the real
 //!    kernel entry point. This is the kexec entry point.
 //! 2. **Kernel ELF segments** — individual PT_LOAD segments from the vmlinux
-//!    ELF binary, each loaded at its `p_paddr` (physical address). BSS
-//!    regions (where `p_memsz > p_filesz`) are zero-filled.
+//!    ELF binary, each relocated to `p_paddr + load_offset` where
+//!    `load_offset` shifts the kernel from its compiled physical address
+//!    into VTL2 RAM (mirroring `load_static_elf`). BSS regions (where
+//!    `p_memsz > p_filesz`) are zero-filled by the kexec mechanism.
 //! 3. **boot_params** — 4096-byte Linux zero page with e820 map, initrd
 //!    pointer, command line pointer, and `setup_data` chain head.
 //! 4. **Initrd** — compressed initramfs image.
@@ -806,24 +808,29 @@ fn prepare_x86_64(
         "using System RAM range from /proc/iomem for kexec segment placement"
     );
 
-    // Build a single contiguous kernel blob covering all ELF PT_LOAD segments.
-    let highest_seg_end_elf = vmlinux_info
-        .segments
-        .iter()
-        .map(|s| s.paddr + align_up(s.mem_size, PAGE_SIZE))
-        .max()
-        .unwrap();
-    let kernel_blob_size = align_up(highest_seg_end_elf - lowest_paddr, PAGE_SIZE) as usize;
+    // Per-segment relocation: each PT_LOAD segment is placed at its
+    // p_paddr + load_offset, mirroring the approach used by load_static_elf.
+    // This properly handles gaps and BSS regions between segments instead of
+    // building a single contiguous blob.
 
     // Place the kernel at the start of the largest System RAM range,
     // aligned to 2MB (kernel_alignment).
     let kernel_load_phys = align_up(largest_ram.0, 0x200000);
-    let kernel_entry_phys = kernel_load_phys + (vmlinux_info.entry_point - lowest_paddr);
+    let load_offset = kernel_load_phys - lowest_paddr;
+    let kernel_entry_phys = vmlinux_info.entry_point + load_offset;
 
-    let mut kernel_blob = vec![0u8; kernel_blob_size];
+    // Highest physical address used by any relocated segment.
+    let highest_seg_end = vmlinux_info
+        .segments
+        .iter()
+        .map(|s| s.paddr + load_offset + align_up(s.mem_size, PAGE_SIZE))
+        .max()
+        .unwrap();
+
+    // Validate each segment fits and log the relocated addresses.
     for seg in &vmlinux_info.segments {
-        let file_start = seg.file_offset as usize;
-        let file_end = file_start + seg.file_size as usize;
+        let seg_phys = seg.paddr + load_offset;
+        let file_end = seg.file_offset as usize + seg.file_size as usize;
         anyhow::ensure!(
             file_end <= data.vmlinux.len(),
             "ELF segment at offset {:#x} extends past end of file (file_size={:#x}, elf_size={:#x})",
@@ -832,16 +839,20 @@ fn prepare_x86_64(
             data.vmlinux.len()
         );
 
-        let blob_offset = (seg.paddr - lowest_paddr) as usize;
-        kernel_blob[blob_offset..blob_offset + seg.file_size as usize]
-            .copy_from_slice(&data.vmlinux[file_start..file_end]);
+        tracing::info!(
+            paddr = %format_args!("{:#x}", seg.paddr),
+            relocated_phys = %format_args!("{:#x}", seg_phys),
+            file_size = %format_args!("{:#x}", seg.file_size),
+            mem_size = %format_args!("{:#x}", seg.mem_size),
+            "relocating ELF PT_LOAD segment"
+        );
     }
 
     tracing::info!(
         kernel_load_phys = %format_args!("{:#x}", kernel_load_phys),
         kernel_entry_phys = %format_args!("{:#x}", kernel_entry_phys),
-        kernel_blob_size = %format_args!("{:#x}", kernel_blob_size),
-        "loading vmlinux as single contiguous blob"
+        load_offset = %format_args!("{:#x}", load_offset),
+        "loading vmlinux with per-segment relocation"
     );
 
     // Place auxiliary segments after the relocated kernel blob.
@@ -852,7 +863,7 @@ fn prepare_x86_64(
     // within this region so the kernel can access them after switching to
     // its own page tables. The large initrd goes last — it's accessed
     // later when the kernel has full page tables set up.
-    let mut next_addr = align_up(kernel_load_phys + kernel_blob_size as u64, PAGE_SIZE);
+    let mut next_addr = align_up(highest_seg_end, PAGE_SIZE);
 
     // Trampoline (must be before initrd — small, within identity map)
     let trampoline_phys = next_addr;
@@ -927,7 +938,7 @@ fn prepare_x86_64(
     let fdt_buf = fdt.as_bytes().to_vec();
 
     // -- 3. Build boot_params (zero page) ------------------------------------
-    let kernel_init_size = align_up(kernel_blob_size as u64, 0x200000);
+    let kernel_init_size = align_up(highest_seg_end - kernel_load_phys, 0x200000);
     let bp = build_boot_params(
         initrd_phys..initrd_phys + initrd_size,
         cmdline_phys,
@@ -961,19 +972,30 @@ fn prepare_x86_64(
     // -- 5. Assemble segments ------------------------------------------------
     //
     // The trampoline is the first segment and its physical address is the
-    // kexec entry point. The kernel is a single contiguous blob.
+    // kexec entry point. ELF segments follow individually.
     let mut segments = vec![KexecSegment {
         data: trampoline_buf,
         phys_addr: trampoline_phys,
         mem_size: trampoline_memsz,
     }];
 
-    // Add the single kernel blob at the relocated address.
-    segments.push(KexecSegment {
-        data: kernel_blob,
-        phys_addr: kernel_load_phys,
-        mem_size: kernel_blob_size,
-    });
+    // Add individual ELF PT_LOAD segments at relocated addresses
+    // (mirroring load_static_elf's per-segment loading). Each segment
+    // carries only the file data (p_filesz); the kexec mechanism
+    // zero-fills up to mem_size, which handles BSS regions.
+    for seg in &vmlinux_info.segments {
+        let seg_phys = seg.paddr + load_offset;
+        let file_start = seg.file_offset as usize;
+        let file_end = file_start + seg.file_size as usize;
+        let seg_data = data.vmlinux[file_start..file_end].to_vec();
+        let seg_memsz = align_up(seg.mem_size, PAGE_SIZE) as usize;
+
+        segments.push(KexecSegment {
+            data: seg_data,
+            phys_addr: seg_phys,
+            mem_size: seg_memsz,
+        });
+    }
 
     // Add initrd, cmdline, FDT, and boot_params.
     segments.push(KexecSegment {
