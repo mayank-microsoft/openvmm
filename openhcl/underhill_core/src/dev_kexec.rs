@@ -426,6 +426,8 @@ fn build_x86_64_trampoline(boot_params_phys: u64, kernel_entry: u64, page_table_
     code.extend_from_slice(&[0xB8, 0x33, 0x00, 0x01, 0x80]);
     code.extend_from_slice(&[0x0F, 0x22, 0xC0]);
 
+    emit_serial_char(&mut code, b'P'); // before CR3 load
+
     // Load our identity-mapped page tables into CR3.
     //   movabs rax, <page_table_phys>  =>  48 B8 <imm64>
     //   mov cr3, rax                   =>  0F 22 D8
@@ -433,6 +435,8 @@ fn build_x86_64_trampoline(boot_params_phys: u64, kernel_entry: u64, page_table_
     code.push(0xB8);
     code.extend_from_slice(&page_table_phys.to_le_bytes());
     code.extend_from_slice(&[0x0F, 0x22, 0xD8]);
+
+    emit_serial_char(&mut code, b'C'); // CR3 load succeeded
 
     // Clear all debug registers to remove stale hardware breakpoints and
     // watchpoints from the old kernel.
@@ -516,6 +520,8 @@ fn build_x86_64_trampoline(boot_params_phys: u64, kernel_entry: u64, page_table_
     code.push(0x48);
     code.push(0xB8);
     code.extend_from_slice(&kernel_entry.to_le_bytes());
+
+    emit_serial_char(&mut code, b'J'); // about to jump to kernel
 
     // jmp rax  =>  FF E0
     code.extend_from_slice(&[0xFF, 0xE0]);
@@ -803,13 +809,10 @@ fn prepare_x86_64(
     let fdt_buf = fdt.as_bytes().to_vec();
 
     // -- 3. Build boot_params (zero page) ------------------------------------
-    let kernel_init_size = align_up(kernel_blob_size as u64, 0x200000);
     let bp = build_boot_params(
         initrd_phys..initrd_phys + initrd_size,
         cmdline_phys,
         fdt_phys,
-        kernel_load_phys,
-        kernel_init_size,
     )
     .context("failed to build boot_params")?;
 
@@ -887,8 +890,6 @@ fn build_boot_params(
     initrd: std::ops::Range<u64>,
     cmdline_phys: u64,
     setup_data_phys: u64,
-    kernel_load_phys: u64,
-    kernel_init_size: u64,
 ) -> anyhow::Result<loader_defs::linux::boot_params> {
     use loader_defs::linux::boot_params;
     use zerocopy::FromZeros;
@@ -913,11 +914,9 @@ fn build_boot_params(
 
     bp.hdr.setup_data = setup_data_phys.into();
 
-    // Tell the kernel where it was loaded and how much space it needs.
-    bp.hdr.pref_address = kernel_load_phys.into();
-    bp.hdr.init_size = (kernel_init_size as u32).into();
-    bp.hdr.relocatable_kernel = 1;
-    bp.hdr.kernel_alignment = 0x200000u32.into(); // 2MB
+    // NOTE: pref_address/init_size/relocatable_kernel are intentionally NOT
+    // set, matching openhcl_boot behavior. The kernel with CONFIG_RELOCATABLE=y
+    // handles relocation via startup_64 without needing these hints.
 
     build_e820_map(&mut bp)?;
 
