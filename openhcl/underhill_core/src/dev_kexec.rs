@@ -633,10 +633,20 @@ fn prepare_x86_64(
 
     // Start at a 2 MB-aligned address within the RAM range.
     let kernel_load_phys = align_up(usable_ram.start, PHYSICAL_ALIGN);
-    let mut next_addr = kernel_load_phys;
 
-    // Build kexec segments for each ELF PT_LOAD, placed sequentially.
+    // Place each ELF PT_LOAD segment preserving the relative offsets from
+    // the original ELF layout. The kernel's virtual address mapping and
+    // self-relocation logic depend on the inter-segment distances being
+    // maintained exactly as they appear in the ELF.
+    let lowest_seg_paddr = vmlinux_info
+        .segments
+        .iter()
+        .map(|s| s.paddr)
+        .min()
+        .unwrap();
+
     let mut kernel_segments = Vec::new();
+    let mut highest_seg_end: u64 = 0;
     for seg in &vmlinux_info.segments {
         let seg_memsz = align_up(seg.mem_size, PAGE_SIZE) as usize;
 
@@ -657,8 +667,12 @@ fn prepare_x86_64(
             seg_data.resize(seg.mem_size as usize, 0);
         }
 
-        let seg_phys = next_addr;
-        next_addr += seg_memsz as u64;
+        // Preserve relative offset from the lowest segment.
+        let seg_phys = kernel_load_phys + (seg.paddr - lowest_seg_paddr);
+        let seg_end = seg_phys + seg_memsz as u64;
+        if seg_end > highest_seg_end {
+            highest_seg_end = seg_end;
+        }
 
         tracing::info!(
             original_paddr = %format_args!("{:#x}", seg.paddr),
@@ -674,14 +688,8 @@ fn prepare_x86_64(
         });
     }
 
-    // Compute the kernel entry point: offset from lowest original p_paddr
-    // applied to our load base.
-    let lowest_seg_paddr = vmlinux_info
-        .segments
-        .iter()
-        .map(|s| s.paddr)
-        .min()
-        .unwrap();
+    let mut next_addr = align_up(highest_seg_end, PAGE_SIZE);
+
     let kernel_entry_phys = kernel_load_phys + (vmlinux_info.entry_point - lowest_seg_paddr);
     tracing::info!(
         original_entry = %format_args!("{:#x}", vmlinux_info.entry_point),
