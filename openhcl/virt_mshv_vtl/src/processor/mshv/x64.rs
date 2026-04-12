@@ -1834,6 +1834,7 @@ mod save_restore {
     use hcl::GuestVtl;
     use hvdef::HV_X64_MSR_GUEST_CRASH_CTL;
     use hvdef::HvInternalActivityRegister;
+    use hvdef::HvRegisterValue;
     use hvdef::HvX64RegisterName;
     use hvdef::Vtl;
     use virt::Processor;
@@ -1921,6 +1922,18 @@ mod save_restore {
             pub(super) variable_mtrrs: Option<[u64; 16]>,
             #[mesh(29)]
             pub(super) per_vtl: Vec<ProcessorVtlSavedState>,
+
+            /// VTL0 hypervisor-managed registers. These are normally preserved
+            /// by the hypervisor across host-driven servicing, but must be
+            /// explicitly saved/restored for dev-servicing kexec because the
+            /// VTL2 SMP boot issues HVCALL_START_VP which can disturb VTL0
+            /// register state.
+            #[mesh(30)]
+            pub(super) vtl0_rsp: Option<u64>,
+            #[mesh(31)]
+            pub(super) vtl0_rip: Option<u64>,
+            #[mesh(32)]
+            pub(super) vtl0_rflags: Option<u64>,
         }
 
         #[derive(Protobuf, SavedStateRoot)]
@@ -2072,6 +2085,20 @@ mod save_restore {
                 })
                 .into();
 
+            // Read VTL0 hypervisor-managed registers that are not part of
+            // the cpu_context. These must be explicitly saved for
+            // dev-servicing kexec where VTL2 SMP boot can reset VP state.
+            let vtl0_managed_names = [
+                HvX64RegisterName::Rsp,
+                HvX64RegisterName::Rip,
+                HvX64RegisterName::Rflags,
+            ];
+            let mut vtl0_managed_values = [FromZeros::new_zeroed(); 3];
+            self.runner
+                .get_vp_registers(GuestVtl::Vtl0, &vtl0_managed_names, &mut vtl0_managed_values)
+                .context("failed to get VTL0 managed registers")
+                .map_err(SaveError::Other)?;
+
             let state = state::ProcessorSavedState {
                 rax,
                 rcx,
@@ -2102,6 +2129,9 @@ mod save_restore {
                 fixed_mtrrs: Some(fixed_mtrrs),
                 variable_mtrrs: Some(variable_mtrrs),
                 per_vtl,
+                vtl0_rsp: Some(vtl0_managed_values[0].as_u64()),
+                vtl0_rip: Some(vtl0_managed_values[1].as_u64()),
+                vtl0_rflags: Some(vtl0_managed_values[2].as_u64()),
             };
 
             Ok(state)
@@ -2138,6 +2168,9 @@ mod save_restore {
                 fixed_mtrrs,
                 variable_mtrrs,
                 per_vtl,
+                vtl0_rsp,
+                vtl0_rip,
+                vtl0_rflags,
             } = state;
 
             let dr6_shared = self.partition.hcl.dr6_shared();
@@ -2175,6 +2208,26 @@ mod save_restore {
                 .fx_state
                 .as_mut_bytes()
                 .copy_from_slice(&fx_state);
+
+            // Restore VTL0 hypervisor-managed registers if present in saved
+            // state. Older saved states won't have these (Option::None), in
+            // which case we rely on the hypervisor having preserved them.
+            let mut vtl0_regs: Vec<(HvX64RegisterName, HvRegisterValue)> = Vec::new();
+            if let Some(rsp) = vtl0_rsp {
+                vtl0_regs.push((HvX64RegisterName::Rsp, rsp.into()));
+            }
+            if let Some(rip) = vtl0_rip {
+                vtl0_regs.push((HvX64RegisterName::Rip, rip.into()));
+            }
+            if let Some(rflags) = vtl0_rflags {
+                vtl0_regs.push((HvX64RegisterName::Rflags, rflags.into()));
+            }
+            if !vtl0_regs.is_empty() {
+                self.runner
+                    .set_vp_registers(GuestVtl::Vtl0, vtl0_regs)
+                    .context("failed to restore VTL0 managed registers")
+                    .map_err(RestoreError::Other)?;
+            }
 
             self.crash_reg = crash_reg.unwrap_or_default();
 
