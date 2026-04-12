@@ -419,7 +419,7 @@ pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info
 
     drop(mapping);
 
-    //1assert_eq!(measured_config.magic, ParavisorMeasuredVtl2Config::MAGIC);
+    assert_eq!(measured_config.magic, ParavisorMeasuredVtl2Config::MAGIC);
 
     let vtom_offset_bit = if measured_config.vtom_offset_bit == 0 {
         None
