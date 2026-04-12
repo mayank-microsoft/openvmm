@@ -6,7 +6,7 @@
 
 #![cfg(target_os = "linux")]
 #![expect(missing_docs)]
-#![forbid(unsafe_code)]
+#![expect(unsafe_code)]
 
 mod dev_kexec;
 mod diag;

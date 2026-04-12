@@ -42,6 +42,15 @@ use bootloader_fdt_parser::ParsedBootDtInfo;
 use diag_server::DevServicingData;
 use kexec_sys::KexecSegment;
 
+// Assemble architecture-specific trampoline code at build time.
+// The assembled bytes are extracted at runtime via extern symbols and
+// copied into the kexec trampoline code page.
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(include_str!("kexec_trampoline_x86_64.S"));
+
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(include_str!("kexec_trampoline_aarch64.S"));
+
 /// Well-known path where the serialized servicing state is placed inside
 /// the initramfs CPIO overlay. The next boot reads this file to restore
 /// device state after a dev-servicing kexec.
@@ -295,311 +304,142 @@ fn build_identity_page_tables(base_phys: u64, max_phys_addr: u64) -> Vec<u8> {
 /// 6. Sets CS/DS/ES/SS per the 64-bit boot protocol
 /// 7. Zeros all general-purpose registers
 /// 8. Sets RDI=0, RSI=boot_params, RAX=entry and jumps to kernel
+/// Return the assembled x86_64 trampoline code bytes.
+///
+/// The code is assembled at build time from `kexec_trampoline_x86_64.S`
+/// via `global_asm!` and extracted here through extern symbol references.
 #[cfg(target_arch = "x86_64")]
-fn build_x86_64_trampoline(boot_params_phys: u64, kernel_entry: u64, page_table_phys: u64) -> Vec<u8> {
-    let mut code = Vec::with_capacity(256);
-
-    // Helper: emit instructions to write one character to COM3 with
-    // busy-wait on the transmit holding register.
-    //
-    // For each character the sequence is:
-    //   mov dx, 0x3ED        ; LSR (COM3 + 5)
-    // ---- CPU state cleanup -------------------------------------------------
-    //
-    // The old kernel's machine_kexec copied our segments to their final
-    // physical addresses and jumped here with identity-mapped paging, but
-    // the control registers, debug registers, and segment selectors may
-    // still carry the old kernel's configuration. We reset everything to
-    // the minimal state that Linux startup_64 expects.
-
-    // cli — disable maskable interrupts
-    code.push(0xFA);
-
-    // cld — clear direction flag
-    code.push(0xFC);
-
-    // Disable NMI by setting bit 7 of CMOS address port.
-    //   mov al, 0x80  =>  B0 80
-    //   out 0x70, al  =>  E6 70
-    code.extend_from_slice(&[0xB0, 0x80, 0xE6, 0x70]);
-
-    // Set CR4 = PAE only (bit 5 = 0x20).
-    // This clears SMEP, SMAP, UMIP, PCIDE, OSXSAVE, OSFXSR, etc.
-    // The kernel will re-enable features it needs.
-    //   mov eax, 0x20      =>  B8 20 00 00 00
-    //   mov cr4, rax       =>  0F 22 E0
-    code.extend_from_slice(&[0xB8, 0x20, 0x00, 0x00, 0x00]);
-    code.extend_from_slice(&[0x0F, 0x22, 0xE0]);
-
-    // Set CR0 = PG | WP | NE | ET | MP | PE.
-    //   PG  = bit 31 = 0x80000000
-    //   WP  = bit 16 = 0x00010000
-    //   NE  = bit  5 = 0x00000020
-    //   ET  = bit  4 = 0x00000010
-    //   MP  = bit  1 = 0x00000002
-    //   PE  = bit  0 = 0x00000001
-    //   Total        = 0x80010033
-    // This clears CD (cache disable) and NW (not write-through).
-    //   mov eax, 0x80010033  =>  B8 33 00 01 80
-    //   mov cr0, rax         =>  0F 22 C0
-    code.extend_from_slice(&[0xB8, 0x33, 0x00, 0x01, 0x80]);
-    code.extend_from_slice(&[0x0F, 0x22, 0xC0]);
-
-    // Load our identity-mapped page tables into CR3.
-    //   movabs rax, <page_table_phys>  =>  48 B8 <imm64>
-    //   mov cr3, rax                   =>  0F 22 D8
-    code.push(0x48);
-    code.push(0xB8);
-    code.extend_from_slice(&page_table_phys.to_le_bytes());
-    code.extend_from_slice(&[0x0F, 0x22, 0xD8]);
-
-    // Clear all debug registers to remove stale hardware breakpoints and
-    // watchpoints from the old kernel.
-    //   xor eax, eax  =>  31 C0
-    code.extend_from_slice(&[0x31, 0xC0]);
-    //   mov dr0, rax  =>  0F 23 C0
-    code.extend_from_slice(&[0x0F, 0x23, 0xC0]);
-    //   mov dr1, rax  =>  0F 23 C8
-    code.extend_from_slice(&[0x0F, 0x23, 0xC8]);
-    //   mov dr2, rax  =>  0F 23 D0
-    code.extend_from_slice(&[0x0F, 0x23, 0xD0]);
-    //   mov dr3, rax  =>  0F 23 D8
-    code.extend_from_slice(&[0x0F, 0x23, 0xD8]);
-    //   mov dr6, rax  =>  0F 23 F0   (clear debug status)
-    code.extend_from_slice(&[0x0F, 0x23, 0xF0]);
-    //   mov dr7, rax  =>  0F 23 F8   (disable all breakpoints)
-    code.extend_from_slice(&[0x0F, 0x23, 0xF8]);
-
-    // --- Load a GDT per the 64-bit boot protocol ---
-    // The kernel expects __BOOT_CS (0x10) and __BOOT_DS (0x18) in the GDT.
-    // We place the GDT data at offset 0xF00 within this page (well past
-    // the code) and reference it via the trampoline's physical address.
-    //
-    // GDT layout (4 entries × 8 bytes = 32 bytes):
-    //   [0x00] null descriptor
-    //   [0x08] unused (padding so __BOOT_CS = 0x10)
-    //   [0x10] __BOOT_CS: 64-bit code, execute/read, DPL 0
-    //   [0x18] __BOOT_DS: data, read/write, DPL 0
-    //
-    // GDT descriptor (10 bytes): 2-byte limit + 8-byte base address
-
-    // Compute GDT base = trampoline_phys + 0xF00 (filled in at end of fn)
-    // We store the LGDT descriptor at offset 0xEF0 (6 bytes: 2 limit + 4 base)
-    // Actually, we'll use a RIP-relative approach: compute GDT address
-    // from the page_table_phys we already have in a register... NO, simpler
-    // to just embed the absolute address.
-
-    // movabs rax, <trampoline_phys + 0xF00>  (GDT base)
-    //   48 B8 <imm64>
-    // We don't have trampoline_phys here yet... but we do have page_table_phys.
-    // Actually, the GDT address is embedded later. Let's use lea rax, [rip + offset].
-    // We know the GDT is at a fixed offset from the current code position.
-    // But the offset depends on how many bytes of code precede this.
-    //
-    // Simpler approach: just embed the GDT descriptor inline and use
-    // lea to get its address via RIP-relative.
-
-    // lea rax, [rip + gdt_data_offset]  -- we'll compute offset below
-    // For now, emit a placeholder and patch it.
-    let _lgdt_fixup_pos = code.len();
-
-    // lgdt [rip + offset] approach:
-    // sub rsp, 16 => 48 83 EC 10  (make stack space for GDT descriptor)
-    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x10]);
-
-    // mov word [rsp], 31  => 66 C7 04 24 1F 00  (GDT limit = 4*8-1 = 31)
-    code.extend_from_slice(&[0x66, 0xC7, 0x04, 0x24, 0x1F, 0x00]);
-
-    // lea rax, [rip + <offset_to_gdt>]  => 48 8D 05 XX XX XX XX
-    let lea_rip_pos = code.len();
-    code.extend_from_slice(&[0x48, 0x8D, 0x05, 0x00, 0x00, 0x00, 0x00]); // placeholder offset
-
-    // mov [rsp+2], rax  => 48 89 44 24 02
-    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x02]);
-
-    // lgdt [rsp]  => 0F 01 14 24
-    code.extend_from_slice(&[0x0F, 0x01, 0x14, 0x24]);
-
-    // add rsp, 16  => 48 83 C4 10
-    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x10]);
-
-    // Load segment selectors per 64-bit boot protocol:
-    // DS = ES = SS = __BOOT_DS (0x18)
-    //   mov ax, 0x18  =>  66 B8 18 00
-    code.extend_from_slice(&[0x66, 0xB8, 0x18, 0x00]);
-    //   mov ds, ax  =>  8E D8
-    code.extend_from_slice(&[0x8E, 0xD8]);
-    //   mov es, ax  =>  8E C0
-    code.extend_from_slice(&[0x8E, 0xC0]);
-    //   mov ss, ax  =>  8E D0
-    code.extend_from_slice(&[0x8E, 0xD0]);
-    // FS and GS can be null
-    //   xor eax, eax  =>  31 C0
-    code.extend_from_slice(&[0x31, 0xC0]);
-    //   mov fs, ax  =>  8E E0
-    code.extend_from_slice(&[0x8E, 0xE0]);
-    //   mov gs, ax  =>  8E E8
-    code.extend_from_slice(&[0x8E, 0xE8]);
-
-    // Reload CS = __BOOT_CS (0x10) via far return
-    //   push 0x10        =>  6A 10
-    code.extend_from_slice(&[0x6A, 0x10]);
-    //   lea rax, [rip+0] =>  48 8D 05 00 00 00 00  (address of next instruction)
-    let cs_reload_lea_pos = code.len();
-    code.extend_from_slice(&[0x48, 0x8D, 0x05, 0x00, 0x00, 0x00, 0x00]);
-    // The LEA target should be the instruction AFTER lretq
-    //   push rax         =>  50
-    code.push(0x50);
-    //   lretq            =>  48 CB
-    code.extend_from_slice(&[0x48, 0xCB]);
-    // -- execution continues here after lretq with CS=0x10 --
-    let cs_reload_target = code.len();
-    // Patch the LEA offset: target - (lea_pos + 7) = relative offset
-    let cs_rel = (cs_reload_target as i32) - (cs_reload_lea_pos as i32 + 7);
-    code[cs_reload_lea_pos + 3..cs_reload_lea_pos + 7]
-        .copy_from_slice(&cs_rel.to_le_bytes());
-
-    // ---- Clear general-purpose registers ------------------------------------
-    //
-    // Zero all GPRs so the kernel doesn't see stale values from the old
-    // kernel's context. RSI and RDI are set in phase 4.
-
-    //   xor ecx, ecx  =>  31 C9
-    code.extend_from_slice(&[0x31, 0xC9]);
-    //   xor edx, edx  =>  31 D2
-    code.extend_from_slice(&[0x31, 0xD2]);
-    //   xor ebx, ebx  =>  31 DB
-    code.extend_from_slice(&[0x31, 0xDB]);
-    //   xor ebp, ebp  =>  31 ED
-    code.extend_from_slice(&[0x31, 0xED]);
-    //   xor esp, esp  =>  31 E4   (kernel sets up its own stack)
-    code.extend_from_slice(&[0x31, 0xE4]);
-
-    //   xor r8d,  r8d   =>  45 31 C0
-    code.extend_from_slice(&[0x45, 0x31, 0xC0]);
-    //   xor r9d,  r9d   =>  45 31 C9
-    code.extend_from_slice(&[0x45, 0x31, 0xC9]);
-    //   xor r10d, r10d  =>  45 31 D2
-    code.extend_from_slice(&[0x45, 0x31, 0xD2]);
-    //   xor r11d, r11d  =>  45 31 DB
-    code.extend_from_slice(&[0x45, 0x31, 0xDB]);
-    //   xor r12d, r12d  =>  45 31 E4
-    code.extend_from_slice(&[0x45, 0x31, 0xE4]);
-    //   xor r13d, r13d  =>  45 31 ED
-    code.extend_from_slice(&[0x45, 0x31, 0xED]);
-    //   xor r14d, r14d  =>  45 31 F6
-    code.extend_from_slice(&[0x45, 0x31, 0xF6]);
-    //   xor r15d, r15d  =>  45 31 FF
-    code.extend_from_slice(&[0x45, 0x31, 0xFF]);
-
-    // ---- Set up boot protocol registers and jump ----------------------------
-
-    // xor edi, edi  =>  31 FF
-    code.extend_from_slice(&[0x31, 0xFF]);
-
-    // movabs rsi, imm64  =>  48 BE <imm64 little-endian>
-    code.push(0x48);
-    code.push(0xBE);
-    code.extend_from_slice(&boot_params_phys.to_le_bytes());
-
-    // movabs rax, imm64  =>  48 B8 <imm64 little-endian>
-    code.push(0x48);
-    code.push(0xB8);
-    code.extend_from_slice(&kernel_entry.to_le_bytes());
-
-    // jmp rax  =>  FF E0
-    code.extend_from_slice(&[0xFF, 0xE0]);
-
-    // ---- GDT data (placed after all code) ----------------------------------
-    //
-    // Patch the LEA [rip + offset] to point here.
-    let gdt_data_offset = code.len();
-    let lea_end = lea_rip_pos + 7; // LEA instruction is 7 bytes
-    let gdt_rel = (gdt_data_offset as i32) - (lea_end as i32);
-    code[lea_rip_pos + 3..lea_rip_pos + 7]
-        .copy_from_slice(&gdt_rel.to_le_bytes());
-
-    // GDT entries (4 × 8 bytes = 32 bytes):
-    // Entry 0 (0x00): null descriptor
-    code.extend_from_slice(&[0x00; 8]);
-    // Entry 1 (0x08): unused (padding)
-    code.extend_from_slice(&[0x00; 8]);
-    // Entry 2 (0x10): __BOOT_CS — 64-bit code segment, execute/read, DPL 0
-    //   Limit 0xFFFFF, Base 0, G=1 D=0 L=1 P=1 DPL=0 S=1 Type=0xA (exec/read)
-    //   Bytes: 0xFF 0xFF 0x00 0x00 0x00 0x9A 0xAF 0x00
-    code.extend_from_slice(&[0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xAF, 0x00]);
-    // Entry 3 (0x18): __BOOT_DS — data segment, read/write, DPL 0
-    //   Limit 0xFFFFF, Base 0, G=1 D/B=1 L=0 P=1 DPL=0 S=1 Type=0x2 (read/write)
-    //   Bytes: 0xFF 0xFF 0x00 0x00 0x00 0x92 0xCF 0x00
-    code.extend_from_slice(&[0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF, 0x00]);
-
-    code
+fn trampoline_x86_code() -> &'static [u8] {
+    unsafe {
+        unsafe extern "C" {
+            static kexec_trampoline_x86_64_start: u8;
+            static kexec_trampoline_x86_64_end: u8;
+        }
+        let start = &kexec_trampoline_x86_64_start as *const u8;
+        let end = &kexec_trampoline_x86_64_end as *const u8;
+        let size = end.offset_from(start) as usize;
+        core::slice::from_raw_parts(start, size)
+    }
 }
 
-/// Build an aarch64 trampoline code stub.
+/// Build the two-page x86_64 trampoline buffer (parameter page + code page).
 ///
-/// The generated machine code performs the following:
+/// The parameter page (page 0) contains all runtime-dependent values at
+/// fixed offsets. The code page (page 1) contains the static, position-
+/// independent trampoline assembled from `kexec_trampoline_x86_64.S`.
+///
+/// # Layout
 /// ```text
-///   ldr  x0, =<fdt_phys>    ; x0 = FDT physical address
-///   mov  x1, #0             ; x1 = 0
-///   mov  x2, #0             ; x2 = 0
-///   mov  x3, #0             ; x3 = 0
-///   ldr  x4, =<entry_point> ; x4 = kernel entry point
-///   br   x4                 ; branch to kernel
+/// Page 0 (param_page_phys):
+///   0x000: boot_params_phys (u64)
+///   0x008: kernel_entry (u64)
+///   0x010: page_table_phys (u64)
+///   0x018: cr4_value (u64) — PAE only (0x20)
+///   0x020: cr0_value (u64) — PG|WP|NE|ET|MP|PE (0x80010033)
+///   0x100: GDT descriptor (2-byte limit + 8-byte base)
+///   0x110: GDT entries (4 x 8 bytes)
+///
+/// Page 1 (param_page_phys + 0x1000):
+///   Static trampoline code (kexec entry point)
 /// ```
-///
-/// The Linux ARM64 boot protocol expects:
-/// - x0 → pointer to the device tree blob
-/// - x1, x2, x3 → 0
-///
-/// The 64-bit literal values are stored after the instruction stream and
-/// loaded via PC-relative `ldr` instructions.
-///
-/// Returns the raw machine code bytes.
+#[cfg(target_arch = "x86_64")]
+fn build_x86_64_trampoline_pages(
+    boot_params_phys: u64,
+    kernel_entry: u64,
+    page_table_phys: u64,
+    param_page_phys: u64,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; 2 * PAGE_SIZE as usize];
+
+    // --- Parameter page (page 0) ---
+
+    // Boot protocol registers
+    buf[0x00..0x08].copy_from_slice(&boot_params_phys.to_le_bytes());
+    buf[0x08..0x10].copy_from_slice(&kernel_entry.to_le_bytes());
+    buf[0x10..0x18].copy_from_slice(&page_table_phys.to_le_bytes());
+
+    // CR4 = PAE only (bit 5 = 0x20).
+    // The kernel will re-enable features it needs.
+    buf[0x18..0x20].copy_from_slice(&0x20u64.to_le_bytes());
+
+    // CR0 = PG | WP | NE | ET | MP | PE = 0x80010033.
+    // Clears CD (cache disable) and NW (not write-through).
+    buf[0x20..0x28].copy_from_slice(&0x80010033u64.to_le_bytes());
+
+    // GDT descriptor at offset 0x100: 2-byte limit + 8-byte base.
+    // The base points to the GDT entries at param_page_phys + 0x110.
+    let gdt_entries_phys = param_page_phys + 0x110;
+    let gdt_limit: u16 = 4 * 8 - 1; // 31 (4 entries x 8 bytes - 1)
+    buf[0x100..0x102].copy_from_slice(&gdt_limit.to_le_bytes());
+    buf[0x102..0x10A].copy_from_slice(&gdt_entries_phys.to_le_bytes());
+
+    // GDT entries at offset 0x110 (4 x 8 bytes):
+    //   [0x110] Entry 0 (0x00): null descriptor
+    //   [0x118] Entry 1 (0x08): unused (padding so __BOOT_CS = 0x10)
+    //   [0x120] Entry 2 (0x10): __BOOT_CS — 64-bit code, execute/read, DPL 0
+    //   [0x128] Entry 3 (0x18): __BOOT_DS — data, read/write, DPL 0
+    buf[0x120..0x128].copy_from_slice(&[0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xAF, 0x00]);
+    buf[0x128..0x130].copy_from_slice(&[0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF, 0x00]);
+
+    // --- Code page (page 1) ---
+
+    let code = trampoline_x86_code();
+    assert!(
+        code.len() <= PAGE_SIZE as usize,
+        "x86_64 trampoline code ({} bytes) exceeds page size",
+        code.len()
+    );
+    let page1 = PAGE_SIZE as usize;
+    buf[page1..page1 + code.len()].copy_from_slice(code);
+
+    buf
+}
+
+/// Return the assembled aarch64 trampoline code bytes.
 #[cfg(target_arch = "aarch64")]
-fn build_aarch64_trampoline(fdt_phys: u64, kernel_entry: u64) -> Vec<u8> {
-    let mut code = Vec::with_capacity(48);
+fn trampoline_aarch64_code() -> &'static [u8] {
+    unsafe {
+        unsafe extern "C" {
+            static kexec_trampoline_aarch64_start: u8;
+            static kexec_trampoline_aarch64_end: u8;
+        }
+        let start = &kexec_trampoline_aarch64_start as *const u8;
+        let end = &kexec_trampoline_aarch64_end as *const u8;
+        let size = end.offset_from(start) as usize;
+        core::slice::from_raw_parts(start, size)
+    }
+}
 
-    // The layout is:
-    //   offset 0x00: ldr x0, [pc, #20]   ; load fdt_phys from offset 0x18
-    //   offset 0x04: mov x1, #0
-    //   offset 0x08: mov x2, #0
-    //   offset 0x0C: mov x3, #0
-    //   offset 0x10: ldr x4, [pc, #16]   ; load kernel_entry from offset 0x20
-    //   offset 0x14: br  x4
-    //   offset 0x18: <fdt_phys>           (8 bytes)
-    //   offset 0x20: <kernel_entry>       (8 bytes)
+/// Build the two-page aarch64 trampoline buffer (parameter page + code page).
+///
+/// # Layout
+/// ```text
+/// Page 0 (param_page_phys):
+///   0x000: fdt_phys (u64)
+///   0x008: kernel_entry (u64)
+///
+/// Page 1 (param_page_phys + 0x1000):
+///   Static trampoline code (kexec entry point)
+/// ```
+#[cfg(target_arch = "aarch64")]
+fn build_aarch64_trampoline_pages(fdt_phys: u64, kernel_entry: u64) -> Vec<u8> {
+    let mut buf = vec![0u8; 2 * PAGE_SIZE as usize];
 
-    // ldr x0, [pc, #20]  =>  pc + 20 = 0x00 + 20 = 0x14... wait, let me recalculate.
-    // At offset 0x00, PC = 0x00.  We want to load from offset 0x18.
-    // imm19 offset = (0x18 - 0x00) / 4 = 6.  LDR Xt, label => 0x58000000 | (imm19 << 5) | Rt
-    // ldr x0, #6  =>  0x58000000 | (6 << 5) | 0 = 0x580000C0
-    code.extend_from_slice(&0x580000C0u32.to_le_bytes());
+    // Parameter page (page 0)
+    buf[0x00..0x08].copy_from_slice(&fdt_phys.to_le_bytes());
+    buf[0x08..0x10].copy_from_slice(&kernel_entry.to_le_bytes());
 
-    // mov x1, #0  =>  0xD2800001
-    code.extend_from_slice(&0xD2800001u32.to_le_bytes());
+    // Code page (page 1)
+    let code = trampoline_aarch64_code();
+    assert!(
+        code.len() <= PAGE_SIZE as usize,
+        "aarch64 trampoline code ({} bytes) exceeds page size",
+        code.len()
+    );
+    let page1 = PAGE_SIZE as usize;
+    buf[page1..page1 + code.len()].copy_from_slice(code);
 
-    // mov x2, #0  =>  0xD2800002
-    code.extend_from_slice(&0xD2800002u32.to_le_bytes());
-
-    // mov x3, #0  =>  0xD2800003
-    code.extend_from_slice(&0xD2800003u32.to_le_bytes());
-
-    // ldr x4, [pc, #16]  At offset 0x10, load from offset 0x20.
-    // imm19 offset = (0x20 - 0x10) / 4 = 4.
-    // ldr x4, #4  =>  0x58000000 | (4 << 5) | 4 = 0x58000084
-    code.extend_from_slice(&0x58000084u32.to_le_bytes());
-
-    // br x4  =>  0xD61F0080
-    code.extend_from_slice(&0xD61F0080u32.to_le_bytes());
-
-    // Data literals at offset 0x18
-    code.extend_from_slice(&fdt_phys.to_le_bytes());
-
-    // Data literal at offset 0x20
-    code.extend_from_slice(&kernel_entry.to_le_bytes());
-
-    code
+    buf
 }
 
 /// Prepare kexec segments from dev servicing data and the currently running
@@ -766,8 +606,9 @@ fn prepare_x86_64(
     let mut next_addr = align_up(highest_seg_end, PAGE_SIZE);
 
     // Trampoline (must be before initrd — small, within identity map)
-    let trampoline_phys = next_addr;
-    let trampoline_memsz = PAGE_SIZE as usize;
+    let trampoline_param_phys = next_addr;
+    let trampoline_code_phys = trampoline_param_phys + PAGE_SIZE;
+    let trampoline_memsz = 2 * PAGE_SIZE as usize;
     next_addr += trampoline_memsz as u64;
 
     // Command line (null-terminated) — small, within identity map
@@ -858,13 +699,14 @@ fn prepare_x86_64(
     // Build identity-mapped page tables.
     let page_table_buf = build_identity_page_tables(page_table_phys, max_phys_addr);
 
-    let trampoline_buf = build_x86_64_trampoline(boot_params_phys, kernel_entry_phys, page_table_phys);
+    let trampoline_buf = build_x86_64_trampoline_pages(boot_params_phys, kernel_entry_phys, page_table_phys, trampoline_param_phys);
 
     tracing::info!(
-        trampoline_phys = %format_args!("{:#x}", trampoline_phys),
+        trampoline_param_phys = %format_args!("{:#x}", trampoline_param_phys),
+        trampoline_code_phys = %format_args!("{:#x}", trampoline_code_phys),
         kernel_entry_phys = %format_args!("{:#x}", kernel_entry_phys),
         boot_params_phys = %format_args!("{:#x}", boot_params_phys),
-        "built x86_64 trampoline"
+        "built x86_64 trampoline (param page + code page)"
     );
 
     // -- 5. Assemble segments ------------------------------------------------
@@ -873,7 +715,7 @@ fn prepare_x86_64(
     // kexec entry point. ELF segments follow individually.
     let mut segments = vec![KexecSegment {
         data: trampoline_buf,
-        phys_addr: trampoline_phys,
+        phys_addr: trampoline_param_phys,
         mem_size: trampoline_memsz,
     }];
 
@@ -922,7 +764,7 @@ fn prepare_x86_64(
         mem_size: page_table_memsz,
     });
 
-    Ok((trampoline_phys, segments))
+    Ok((trampoline_code_phys, segments))
 }
 
 /// Construct `boot_params` (zero page) mimicking `openhcl_boot`.
@@ -1183,8 +1025,9 @@ fn prepare_aarch64(
     let mut next_addr = align_up(largest_ram.range.start() + 2 * 1024 * 1024, PAGE_SIZE);
 
     // Trampoline (placed first; its address becomes the kexec entry point)
-    let trampoline_phys = next_addr;
-    let trampoline_memsz = PAGE_SIZE as usize;
+    let trampoline_param_phys = next_addr;
+    let trampoline_code_phys = trampoline_param_phys + PAGE_SIZE;
+    let trampoline_memsz = 2 * PAGE_SIZE as usize;
     next_addr += trampoline_memsz as u64;
 
     // For ARM64 Image format, the kernel must be loaded at a 2MB-aligned
@@ -1233,13 +1076,14 @@ fn prepare_aarch64(
     // The trampoline sets up the register state that the Linux ARM64 boot
     // protocol requires (x0 = FDT pointer, x1-x3 = 0) and then branches
     // to the real kernel entry point.
-    let trampoline_buf = build_aarch64_trampoline(fdt_phys, entry_point);
+    let trampoline_buf = build_aarch64_trampoline_pages(fdt_phys, entry_point);
 
     tracing::info!(
-        trampoline_phys = %format_args!("{:#x}", trampoline_phys),
+        trampoline_param_phys = %format_args!("{:#x}", trampoline_param_phys),
+        trampoline_code_phys = %format_args!("{:#x}", trampoline_code_phys),
         kernel_entry = %format_args!("{:#x}", entry_point),
         fdt_phys = %format_args!("{:#x}", fdt_phys),
-        "built aarch64 trampoline"
+        "built aarch64 trampoline (param page + code page)"
     );
 
     // Assemble segments.
@@ -1249,7 +1093,7 @@ fn prepare_aarch64(
     let segments = vec![
         KexecSegment {
             data: trampoline_buf,
-            phys_addr: trampoline_phys,
+            phys_addr: trampoline_param_phys,
             mem_size: trampoline_memsz,
         },
         KexecSegment {
@@ -1269,7 +1113,7 @@ fn prepare_aarch64(
         },
     ];
 
-    Ok((trampoline_phys, segments))
+    Ok((trampoline_code_phys, segments))
 }
 
 // ---- Device tree construction ----------------------------------------------
