@@ -290,7 +290,7 @@ pub fn write_persisted_info(
 pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info)> {
     let parsed_openhcl_boot = ParsedBootDtInfo::new().context("failed to parse openhcl_boot dt")?;
 
-    let mapping = Vtl2ParamsMap::new(&parsed_openhcl_boot.config_ranges, true)
+    let mapping = Vtl2ParamsMap::new(&parsed_openhcl_boot.config_ranges, false)
         .context("failed to map igvm parameters")?;
 
     // For the various ACPI tables, read the header to see how big the table
@@ -419,7 +419,7 @@ pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info
 
     drop(mapping);
 
-    //1assert_eq!(measured_config.magic, ParavisorMeasuredVtl2Config::MAGIC);
+    assert_eq!(measured_config.magic, ParavisorMeasuredVtl2Config::MAGIC);
 
     let vtom_offset_bit = if measured_config.vtom_offset_bit == 0 {
         None

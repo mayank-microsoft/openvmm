@@ -194,6 +194,30 @@ pub fn perform_kexec(mut data: DevServicingData) -> anyhow::Result<()> {
     let (entry_point, segments) = prepare_kexec_segments(data, &vmlinux_info, &boot_dt_info)
         .context("failed to prepare kexec segments")?;
 
+    // Verify VTL2 config pages are intact before kexec.
+    if let Some(config_range) = boot_dt_info.config_ranges.first() {
+        let config_phys = config_range.start();
+        let page_index = loader_defs::paravisor::PARAVISOR_MEASURED_VTL2_CONFIG_PAGE_INDEX;
+        let magic_offset = (page_index * 4096) as usize;
+        match std::fs::File::open("/dev/mem") {
+            Ok(f) => {
+                use std::os::unix::fs::FileExt;
+                let mut buf = [0u8; 8];
+                if f.read_exact_at(&mut buf, config_phys + magic_offset as u64).is_ok() {
+                    let magic = u64::from_le_bytes(buf);
+                    tracing::info!(
+                        config_phys = %format_args!("{:#x}", config_phys),
+                        magic_offset = %format_args!("{:#x}", magic_offset),
+                        magic = %format_args!("{:#x}", magic),
+                        expected = %format_args!("{:#x}", 0x4F48434C56544C32u64),
+                        "VTL2 config magic BEFORE kexec_load"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "could not open /dev/mem to verify config"),
+        }
+    }
+
     // Load the segments into the kernel.
     kexec_sys::kexec_load(entry_point, &segments).context("kexec_load failed")?;
 
