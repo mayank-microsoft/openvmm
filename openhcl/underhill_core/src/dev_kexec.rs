@@ -693,25 +693,29 @@ fn prepare_x86_64(
     // (trampoline, initrd, FDT, boot_params, cmdline) are placed after
     // the highest ELF segment in the largest VTL2 RAM range.
 
-    // Find the largest System RAM range from /proc/iomem for segment placement.
+    // Find the largest System RAM range from /proc/iomem for auxiliary
+    // segment placement (initrd, FDT, page tables, etc.).
     let largest_ram = find_largest_system_ram()
         .context("failed to find System RAM in /proc/iomem")?;
 
+    // Find the currently running kernel's physical base address from
+    // /proc/iomem. By loading the new kernel at the same address, we
+    // ensure it occupies the same physical pages as the old kernel.
+    // The kernel self-reserves its own footprint via memblock, so this
+    // memory won't be allocated for other purposes. This avoids the
+    // need to reconstruct complex e820 reserved regions.
+    let current_kernel_phys = find_current_kernel_phys()
+        .context("failed to find current kernel physical address")?;
+
     tracing::info!(
-        range_start = %format_args!("{:#x}", largest_ram.0),
-        range_end = %format_args!("{:#x}", largest_ram.1),
-        range_len = %format_args!("{:#x}", largest_ram.1 - largest_ram.0),
-        "using System RAM range from /proc/iomem for kexec segment placement"
+        current_kernel_phys = %format_args!("{:#x}", current_kernel_phys),
+        largest_ram_start = %format_args!("{:#x}", largest_ram.0),
+        largest_ram_end = %format_args!("{:#x}", largest_ram.1),
+        "placing kexec kernel at current kernel's physical address"
     );
 
-    // Per-segment relocation: each PT_LOAD segment is placed at its
-    // p_paddr + load_offset, mirroring the approach used by load_static_elf.
-    // This properly handles gaps and BSS regions between segments instead of
-    // building a single contiguous blob.
-
-    // Place the kernel at the start of the largest System RAM range,
-    // aligned to 2MB (kernel_alignment).
-    let kernel_load_phys = align_up(largest_ram.0, 0x200000);
+    // Place the new kernel at the same physical base as the running kernel.
+    let kernel_load_phys = current_kernel_phys;
     let load_offset = kernel_load_phys - lowest_paddr;
     let kernel_entry_phys = vmlinux_info.entry_point + load_offset;
 
@@ -959,6 +963,39 @@ fn build_boot_params(
     build_e820_map(&mut bp, boot_dt_info)?;
 
     Ok(bp)
+}
+
+/// Find the physical base address of the currently running kernel
+/// by parsing the "Kernel code" entry from /proc/iomem.
+///
+/// The "Kernel code" sub-region is indented under a "System RAM" entry
+/// and gives the exact physical range where the kernel text is loaded.
+/// We use the start address (aligned down to 2MB) as the load base.
+#[cfg(target_arch = "x86_64")]
+fn find_current_kernel_phys() -> anyhow::Result<u64> {
+    let content = std::fs::read_to_string("/proc/iomem")
+        .context("failed to read /proc/iomem")?;
+
+    for line in content.lines() {
+        // "Kernel code" is an indented sub-region
+        if !line.contains("Kernel code") {
+            continue;
+        }
+        let addr_part = line.split(':').next().unwrap_or("").trim();
+        let start_hex = addr_part.split('-').next().unwrap_or("").trim();
+        let start = u64::from_str_radix(start_hex, 16)
+            .with_context(|| format!("bad Kernel code start address {:?}", start_hex))?;
+        // Align down to 2MB boundary (kernel_alignment)
+        let aligned = start & !0x1FFFFF;
+        tracing::info!(
+            kernel_code_start = %format_args!("{:#x}", start),
+            aligned_base = %format_args!("{:#x}", aligned),
+            "found running kernel physical address from /proc/iomem"
+        );
+        return Ok(aligned);
+    }
+
+    anyhow::bail!("no Kernel code entry found in /proc/iomem")
 }
 
 /// Find the largest "System RAM" range from `/proc/iomem`.
