@@ -838,6 +838,7 @@ fn prepare_x86_64(
         initrd_phys..initrd_phys + initrd_size,
         cmdline_phys,
         fdt_phys,
+        boot_dt_info,
     )
     .context("failed to build boot_params")?;
 
@@ -926,6 +927,7 @@ fn build_boot_params(
     initrd: std::ops::Range<u64>,
     cmdline_phys: u64,
     setup_data_phys: u64,
+    boot_dt_info: &ParsedBootDtInfo,
 ) -> anyhow::Result<loader_defs::linux::boot_params> {
     use loader_defs::linux::boot_params;
     use zerocopy::FromZeros;
@@ -954,7 +956,7 @@ fn build_boot_params(
     // relocatable_kernel, or kernel_alignment -- leave them as zero
     // to match the working first-boot path.
 
-    build_e820_map(&mut bp)?;
+    build_e820_map(&mut bp, boot_dt_info)?;
 
     Ok(bp)
 }
@@ -990,103 +992,132 @@ fn find_largest_system_ram() -> anyhow::Result<(u64, u64)> {
     best.context("no System RAM found in /proc/iomem")
 }
 
-/// Build the e820 memory map by parsing `/proc/iomem`.
+/// Build the e820 memory map from /proc/iomem and the boot device tree.
 ///
-/// `/proc/iomem` is always available and reflects the kernel's view of the
-/// physical address space. Only top-level (non-indented) entries are used,
-/// as they correspond to the original e820 regions. Nested entries (e.g.
-/// "Kernel code", "Kernel data") are sub-regions and are skipped.
-///
-/// Each line has the format:
-/// ```text
-/// <start>-<end> : <description>
-/// ```
-/// where `<start>` and `<end>` are inclusive hex addresses.
+/// /proc/iomem provides "System RAM" entries but does NOT include
+/// VTL2-specific reserved regions (persisted state, config, GPA pool).
+/// These are synthesized from oot_dt_info to match the e820 map that
+/// openhcl_boot originally provided to the first kernel.
 #[cfg(target_arch = "x86_64")]
-fn build_e820_map(bp: &mut loader_defs::linux::boot_params) -> anyhow::Result<()> {
-    use loader_defs::linux::E820_ACPI;
-    use loader_defs::linux::E820_NVS;
+fn build_e820_map(
+    bp: &mut loader_defs::linux::boot_params,
+    boot_dt_info: &ParsedBootDtInfo,
+) -> anyhow::Result<()> {
     use loader_defs::linux::E820_RAM;
     use loader_defs::linux::E820_RESERVED;
-    use loader_defs::linux::E820_UNUSABLE;
     use loader_defs::linux::e820entry;
 
+    let mut entries: Vec<(u64, u64, u32)> = Vec::new();
+
+    // -- System RAM from /proc/iomem -----------------------------------------
     let iomem = std::fs::read_to_string("/proc/iomem")
         .context("failed to read /proc/iomem")?;
 
-    let max_inline = bp.e820_map.len(); // 128
-    let mut n = 0usize;
-
     for line in iomem.lines() {
-        // Only consider top-level entries (lines that don't start with
-        // whitespace). Indented lines are sub-regions of a parent entry.
         if line.starts_with(' ') || line.starts_with('\t') {
             continue;
         }
-
-        // Format: "<start>-<end> : <description>"
         let Some((range_part, desc_part)) = line.split_once(" : ") else {
-            tracing::warn!(line = line, "skipping malformed /proc/iomem line");
             continue;
         };
-
+        if desc_part.trim() != "System RAM" {
+            continue;
+        }
         let Some((start_hex, end_hex)) = range_part.trim().split_once('-') else {
-            tracing::warn!(line = line, "skipping malformed range in /proc/iomem");
             continue;
         };
-
         let start = u64::from_str_radix(start_hex.trim(), 16)
             .with_context(|| format!("bad start address {:?}", start_hex))?;
         let end = u64::from_str_radix(end_hex.trim(), 16)
             .with_context(|| format!("bad end address {:?}", end_hex))?;
-
-        // /proc/iomem uses inclusive end addresses, so size = end - start + 1.
         let size = end.saturating_sub(start).saturating_add(1);
-        if size == 0 {
+        if size > 0 {
+            entries.push((start, size, E820_RAM));
+        }
+    }
+
+    // -- Reserved ranges from boot device tree -------------------------------
+    let reserved_ranges = [
+        boot_dt_info.vtl2_persisted_header,
+        boot_dt_info.vtl2_persisted_protobuf_region,
+        boot_dt_info.vtl2_reserved_range,
+    ];
+
+    for range in reserved_ranges
+        .iter()
+        .chain(boot_dt_info.config_ranges.iter())
+        .chain(boot_dt_info.private_pool_ranges.iter().map(|r| &r.range))
+    {
+        let start = range.start();
+        let len = range.len();
+        if len > 0 {
+            entries.push((start, len, E820_RESERVED));
+        }
+    }
+
+    // Sort by start address.
+    entries.sort_by_key(|&(start, _, _)| start);
+
+    // Split any RAM entries that overlap with reserved entries.
+    // The reserved ranges from boot_dt_info carve holes in the System RAM
+    // ranges from /proc/iomem.
+    let mut final_entries: Vec<(u64, u64, u32)> = Vec::new();
+    let reserved: Vec<(u64, u64)> = entries
+        .iter()
+        .filter(|e| e.2 == E820_RESERVED)
+        .map(|e| (e.0, e.0 + e.1))
+        .collect();
+
+    for &(start, size, typ) in &entries {
+        if typ == E820_RESERVED {
+            final_entries.push((start, size, typ));
             continue;
         }
-
-        let desc = desc_part.trim();
-        let typ = match desc {
-            "System RAM" => E820_RAM,
-            "Reserved" | "reserved" => E820_RESERVED,
-            "ACPI Tables" => E820_ACPI,
-            "ACPI Non-volatile Storage" => E820_NVS,
-            "Unusable" | "unusable" => E820_UNUSABLE,
-            other => {
-                tracing::warn!(
-                    desc = other,
-                    start = %format_args!("{:#x}", start),
-                    "unknown /proc/iomem type, treating as reserved"
-                );
-                E820_RESERVED
+        // RAM entry: split around any overlapping reserved ranges
+        let mut cur = start;
+        let end = start + size;
+        for &(res_start, res_end) in &reserved {
+            if res_start >= end || res_end <= cur {
+                continue;
             }
-        };
+            if cur < res_start {
+                final_entries.push((cur, res_start - cur, E820_RAM));
+            }
+            cur = cur.max(res_end);
+        }
+        if cur < end {
+            final_entries.push((cur, end - cur, E820_RAM));
+        }
+    }
 
-        anyhow::ensure!(
-            n < max_inline,
-            "e820 map has more than {max_inline} entries; \
-             E820_EXT chaining not yet implemented"
-        );
+    final_entries.sort_by_key(|&(start, _, _)| start);
 
+    let max_inline = bp.e820_map.len();
+    anyhow::ensure!(
+        final_entries.len() <= max_inline,
+        "e820 map has {} entries, exceeding max {}",
+        final_entries.len(),
+        max_inline
+    );
+
+    for (i, &(start, size, typ)) in final_entries.iter().enumerate() {
+        let typ_name = if typ == E820_RAM { "RAM" } else { "reserved" };
         tracing::info!(
-            index = n,
+            index = i,
             start = %format_args!("{:#x}", start),
             size = %format_args!("{:#x}", size),
-            typ = desc,
-            "e820 entry from /proc/iomem"
+            typ = typ_name,
+            "e820 entry"
         );
-
-        bp.e820_map[n] = e820entry {
+        bp.e820_map[i] = e820entry {
             addr: start.into(),
             size: size.into(),
             typ: typ.into(),
         };
-        n += 1;
     }
 
-    bp.e820_entries = n as u8;
-    tracing::info!(e820_entries = n, "built e820 map from /proc/iomem");
+    bp.e820_entries = final_entries.len() as u8;
+    tracing::info!(e820_entries = final_entries.len(), "built e820 map");
     Ok(())
 }
 
