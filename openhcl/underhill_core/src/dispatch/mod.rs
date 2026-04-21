@@ -720,36 +720,65 @@ impl LoadedVm {
 
         Ok(state)
     }
-
     /// Handle a developer-driven VTL2 servicing request.
     ///
-    /// This mirrors the normal servicing flow: stop VPs, save device
-    /// state, shut down devices (network/NVMe/PCI), and then kexec
-    /// into the new kernel.
+    /// Structured for **blackout minimization**: expensive parsing and
+    /// segment preparation happen in the pre-blackout phase (VPs still
+    /// running). Only the irreducible save/teardown/kexec work happens
+    /// in the blackout phase (VPs stopped).
     async fn handle_dev_servicing(
         &mut self,
         mut data: diag_server::DevServicingData,
     ) -> anyhow::Result<()> {
-        // 1. Stop all VPs / state units.
-        let was_running = self.stop().await;
-        tracing::debug!(was_running, "dev servicing: VPs stopped");
+        // ================================================================
+        // PRE-BLACKOUT PHASE -- VPs running, guest unaffected.
+        // Errors here are free: no VPs stopped, no recovery needed.
+        // ================================================================
+        let total_start = std::time::Instant::now();
 
-        // 2. Save all device state (same as normal servicing).
+        let prepared_ctx = crate::dev_kexec::prepare_kexec(
+            &data.vmlinux,
+            &data.command_line,
+        )
+        .context("pre-blackout kexec preparation failed")?;
+
+        tracing::info!(
+            pre_blackout_us = total_start.elapsed().as_micros(),
+            "dev servicing: pre-blackout complete, entering blackout"
+        );
+
+        // ================================================================
+        // BLACKOUT PHASE -- VPs stopped, guest frozen. Minimize this!
+        // ================================================================
+        let blackout_start = std::time::Instant::now();
+
+        // 1. Stop all VPs.
+        let was_running = self.stop().await;
+        tracing::info!(
+            was_running,
+            stop_vps_us = blackout_start.elapsed().as_micros(),
+            "blackout: VPs stopped"
+        );
+
+        // 2. Save all device state.
+        let save_start = std::time::Instant::now();
         let save_result = self
             .save(None, KeepAliveConfig::Disabled, KeepAliveConfig::Disabled)
             .await;
 
         let saved_state = match save_result {
             Ok(state) => {
-                tracing::debug!("dev servicing: device state saved successfully");
+                tracing::info!(
+                    save_us = save_start.elapsed().as_micros(),
+                    "blackout: device state saved"
+                );
                 state
             }
             Err(err) => {
                 tracing::error!(
                     error = err.as_ref() as &dyn std::error::Error,
-                    "dev servicing: device state save failed, attempting recovery"
+                    "blackout: save failed, recovering"
                 );
-                // Try to resume the VM so we don't leave it in a broken state.
                 if was_running {
                     self.start(None).await;
                 }
@@ -757,9 +786,7 @@ impl LoadedVm {
             }
         };
 
-        // 3. Write persisted state for the boot shim, same as normal
-        //    servicing. Without this the next openhcl_boot invocation
-        //    won't have the correct memory map / interrupt state.
+        // 3. Write persisted info for boot shim.
         let nvme_vp_interrupt_state =
             crate::nvme_manager::save_restore_helpers::nvme_interrupt_state(
                 saved_state.init_state.nvme_state.as_ref().map(|n| &n.nvme_state),
@@ -770,15 +797,14 @@ impl LoadedVm {
         )
         .context("failed to write persisted info for dev servicing")?;
 
-        // 4. Shut down devices: network (MANA), NVMe, and PCI —
-        //    same teardown as normal servicing, but without keepalive.
-        //    Note: vmbus_client is already stopped and saved inside
-        //    self.save() — do NOT call vmbus_client.stop() again here.
+        // 4. Shut down devices (parallel).
+        let shutdown_start = std::time::Instant::now();
+
         let shutdown_mana = async {
             if let Some(network_settings) = self.network_settings.as_mut() {
                 network_settings
                     .unload_for_servicing()
-                    .instrument(tracing::info_span!("dev_servicing_shutdown_mana"))
+                    .instrument(tracing::info_span!("blackout_shutdown_mana"))
                     .await;
             }
         };
@@ -786,54 +812,56 @@ impl LoadedVm {
         let shutdown_nvme = async {
             if let Some(nvme_manager) = self.nvme_manager.take() {
                 nvme_manager
-                    .shutdown(false /* no keepalive */)
-                    .instrument(tracing::info_span!("dev_servicing_shutdown_nvme"))
+                    .shutdown(false)
+                    .instrument(tracing::info_span!("blackout_shutdown_nvme"))
                     .await;
             }
         };
 
         let shutdown_pci = async {
             pci_shutdown::shutdown_pci_devices()
-                .instrument(tracing::info_span!("dev_servicing_shutdown_pci"))
+                .instrument(tracing::info_span!("blackout_shutdown_pci"))
                 .await
         };
 
         let (pci_result, (), ()) = (shutdown_pci, shutdown_mana, shutdown_nvme).join().await;
         pci_result.context("failed to shut down PCI devices during dev servicing")?;
 
-        tracing::debug!("dev servicing: all devices shut down, proceeding to kexec");
+        tracing::info!(
+            shutdown_us = shutdown_start.elapsed().as_micros(),
+            "blackout: devices shut down"
+        );
 
-        // 5. Serialize the saved state and append it to the initrd as a
-        //    CPIO overlay so the next kernel can read it at a known path.
+        // 5. Serialize state -> CPIO -> append to initrd.
+        let serialize_start = std::time::Instant::now();
+
         let state_bytes = mesh::payload::encode(saved_state);
         ServicingState::log_data_hash("post-save", &state_bytes);
-        tracing::debug!(
-            state_size = state_bytes.len(),
-            "dev servicing: serialized servicing state"
-        );
 
         let cpio_archive = crate::dev_kexec::build_cpio_archive(
             crate::dev_kexec::DEV_SERVICING_STATE_PATH,
             &state_bytes,
         );
-        tracing::debug!(
-            cpio_size = cpio_archive.len(),
-            path = crate::dev_kexec::DEV_SERVICING_STATE_PATH,
-            "dev servicing: built CPIO archive for servicing state"
-        );
 
-        // The Linux kernel supports concatenated initramfs archives
-        // where each segment can be independently compressed or
-        // uncompressed. After the gzip decompressor finishes the
-        // first archive, unpack_to_rootfs() scans the remaining
-        // bytes for the next archive. Pad to a 4-byte boundary so
-        // the kernel finds the raw CPIO "070701" magic cleanly.
         let pad = (4 - (data.initrd.len() % 4)) % 4;
         data.initrd.extend(std::iter::repeat(0u8).take(pad));
         data.initrd.extend_from_slice(&cpio_archive);
 
-        // 6. Perform the kexec into the new kernel.
-        crate::dev_kexec::perform_kexec(data)
+        tracing::info!(
+            state_size = state_bytes.len(),
+            cpio_size = cpio_archive.len(),
+            initrd_final_size = data.initrd.len(),
+            serialize_us = serialize_start.elapsed().as_micros(),
+            "blackout: state serialized"
+        );
+
+        // 6. Build segments + kexec_load + reboot (using pre-parsed context).
+        tracing::info!(
+            blackout_before_kexec_us = blackout_start.elapsed().as_micros(),
+            "blackout: invoking kexec"
+        );
+
+        crate::dev_kexec::execute_kexec(prepared_ctx, data.vmlinux, data.initrd)
             .context("kexec failed during dev servicing")?;
 
         Ok(())

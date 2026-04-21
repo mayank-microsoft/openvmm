@@ -61,6 +61,146 @@ pub const DEV_SERVICING_STATE_PATH: &str = "/openhcl/dev_servicing_state.bin";
 /// a dev-servicing restart from a fresh boot.
 pub const DEV_SERVICING_CMDLINE_MARKER: &str = "OPENHCL_SERVICING_COMPLETED=1";
 
+/// Pre-parsed kexec context. Built in the **pre-blackout** phase while
+/// VPs are still running. Contains all expensive parsing results so
+/// that the blackout phase only does fast segment assembly + syscalls.
+pub struct PreparedKexecContext {
+    /// Parsed kernel image metadata (entry point, ELF segments, arch).
+    pub vmlinux_info: VmlinuxInfo,
+    /// Parsed boot device tree (memory map, CPU topology, isolation, etc.).
+    pub boot_dt_info: ParsedBootDtInfo,
+    /// Augmented command line with servicing marker and early console.
+    pub command_line: String,
+}
+
+/// **Pre-blackout phase.** Parse the kernel image, read the boot device
+/// tree, and prepare the command line. All I/O and expensive parsing
+/// happens here while VPs are still running, so failures are free
+/// (no VPs stopped, no recovery needed).
+pub fn prepare_kexec(
+    vmlinux: &[u8],
+    command_line: &str,
+) -> anyhow::Result<PreparedKexecContext> {
+    let _span = tracing::info_span!("prepare_kexec_pre_blackout").entered();
+    let prepare_start = std::time::Instant::now();
+
+    let mut cmdline = if command_line.is_empty() {
+        let current = std::fs::read_to_string("/proc/cmdline")
+            .context("failed to read /proc/cmdline")?
+            .trim_end()
+            .to_string();
+        tracing::debug!(
+            command_line = %current,
+            "no command line provided, using current kernel cmdline"
+        );
+        current
+    } else {
+        command_line.to_string()
+    };
+
+    // Append the dev servicing marker and early console parameters.
+    if !cmdline.is_empty() {
+        cmdline.push(' ');
+    }
+    cmdline.push(' ');
+    cmdline.push_str(DEV_SERVICING_CMDLINE_MARKER);
+    cmdline.push_str(" earlycon=uart8250,io,0x3e8,115200n8 console=ttyS2,115200n8");
+
+    let vmlinux_info =
+        crate::vmlinux_parser::parse_vmlinux(vmlinux).context("failed to parse kernel image")?;
+
+    tracing::info!(
+        vmlinux_size = vmlinux.len(),
+        entry_point = %format_args!("{:#x}", vmlinux_info.entry_point),
+        arch = %vmlinux_info.arch,
+        format = %vmlinux_info.format,
+        "pre-blackout: parsed kernel image"
+    );
+
+    let boot_dt_info =
+        ParsedBootDtInfo::new().context("failed to parse boot device tree")?;
+
+    tracing::info!(
+        num_cpus = boot_dt_info.cpus.len(),
+        num_memory_ranges = boot_dt_info.vtl2_memory.len(),
+        prepare_elapsed_us = prepare_start.elapsed().as_micros(),
+        "pre-blackout: kexec preparation complete"
+    );
+
+    Ok(PreparedKexecContext {
+        vmlinux_info,
+        boot_dt_info,
+        command_line: cmdline,
+    })
+}
+
+/// **Blackout phase.** Build kexec segments from the pre-parsed context,
+/// load them via `kexec_load(2)`, and reboot into the new kernel.
+/// On success this function does not return.
+pub fn execute_kexec(
+    ctx: PreparedKexecContext,
+    vmlinux: Vec<u8>,
+    initrd: Vec<u8>,
+) -> anyhow::Result<()> {
+    let _span = tracing::info_span!("execute_kexec_blackout").entered();
+    let execute_start = std::time::Instant::now();
+
+    let data = DevServicingData {
+        initrd,
+        vmlinux,
+        command_line: ctx.command_line,
+    };
+
+    tracing::info!(
+        initrd_size = data.initrd.len(),
+        vmlinux_size = data.vmlinux.len(),
+        "blackout: building kexec segments"
+    );
+
+    let (entry_point, segments) =
+        prepare_kexec_segments(data, &ctx.vmlinux_info, &ctx.boot_dt_info)
+            .context("failed to prepare kexec segments")?;
+
+    tracing::info!(
+        segments_built_us = execute_start.elapsed().as_micros(),
+        "blackout: segments built"
+    );
+
+    // Verify VTL2 config pages are intact before kexec.
+    if let Some(config_range) = ctx.boot_dt_info.config_ranges.first() {
+        let config_phys = config_range.start();
+        let page_index = loader_defs::paravisor::PARAVISOR_MEASURED_VTL2_CONFIG_PAGE_INDEX;
+        let magic_offset = (page_index * 4096) as usize;
+        match std::fs::File::open("/dev/mem") {
+            Ok(f) => {
+                use std::os::unix::fs::FileExt;
+                let mut buf = [0u8; 8];
+                if f.read_exact_at(&mut buf, config_phys + magic_offset as u64).is_ok() {
+                    let magic = u64::from_le_bytes(buf);
+                    tracing::info!(
+                        config_phys = %format_args!("{:#x}", config_phys),
+                        magic = %format_args!("{:#x}", magic),
+                        expected = %format_args!("{:#x}", 0x4F48434C56544C32u64),
+                        "VTL2 config magic BEFORE kexec_load"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "could not open /dev/mem to verify config"),
+        }
+    }
+
+    kexec_sys::kexec_load(entry_point, &segments).context("kexec_load failed")?;
+
+    tracing::info!(
+        total_execute_us = execute_start.elapsed().as_micros(),
+        "blackout: kexec loaded, triggering reboot"
+    );
+
+    kexec_sys::kexec_reboot().context("kexec reboot failed")?;
+    Ok(())
+}
+
+
 /// Build a minimal CPIO "newc" archive containing a single file at the
 /// given `path` with `contents`.
 ///
@@ -150,83 +290,11 @@ pub fn build_cpio_archive(path: &str, contents: &[u8]) -> Vec<u8> {
     archive
 }
 
-/// Top-level entry point for the dev servicing kexec flow.
-///
-/// Parses the kernel image, computes hashes for diagnostics, reads the
-/// boot device tree, builds the kexec segments, loads them, and triggers
-/// the reboot. On success this function does not return.
-pub fn perform_kexec(mut data: DevServicingData) -> anyhow::Result<()> {
-    // If no command line was provided, use the currently running
-    // kernel's command line.
-    if data.command_line.is_empty() {
-        data.command_line = std::fs::read_to_string("/proc/cmdline")
-            .context("failed to read /proc/cmdline")?
-            .trim_end()
-            .to_string();
-        tracing::debug!(
-            command_line = %data.command_line,
-            "no command line provided, using current kernel cmdline"
-        );
-    }
-
-    // Parse the vmlinux/kernel image header to find the entry point.
-    let vmlinux_info =
-        crate::vmlinux_parser::parse_vmlinux(&data.vmlinux).context("failed to parse kernel image")?;
-
-    tracing::debug!(
-        initrd_size = data.initrd.len(),
-        vmlinux_size = data.vmlinux.len(),
-        entry_point = %format_args!("{:#x}", vmlinux_info.entry_point),
-        arch = %vmlinux_info.arch,
-        format = %vmlinux_info.format,
-        command_line = %data.command_line,
-        "dev servicing: preparing kexec"
-    );
-
-    // Parse the boot device tree to obtain the current system's
-    // memory map, CPU topology, isolation type, and other parameters
-    // needed to reconstruct the boot environment.
-    let boot_dt_info =
-        ParsedBootDtInfo::new().context("failed to parse boot device tree")?;
-
-    // Build the kexec segments (kernel, initrd, boot_params, FDT,
-    // command line).
-    let (entry_point, segments) = prepare_kexec_segments(data, &vmlinux_info, &boot_dt_info)
-        .context("failed to prepare kexec segments")?;
-
-    // Verify VTL2 config pages are intact before kexec.
-    if let Some(config_range) = boot_dt_info.config_ranges.first() {
-        let config_phys = config_range.start();
-        let page_index = loader_defs::paravisor::PARAVISOR_MEASURED_VTL2_CONFIG_PAGE_INDEX;
-        let magic_offset = (page_index * 4096) as usize;
-        match std::fs::File::open("/dev/mem") {
-            Ok(f) => {
-                use std::os::unix::fs::FileExt;
-                let mut buf = [0u8; 8];
-                if f.read_exact_at(&mut buf, config_phys + magic_offset as u64).is_ok() {
-                    let magic = u64::from_le_bytes(buf);
-                    tracing::info!(
-                        config_phys = %format_args!("{:#x}", config_phys),
-                        magic_offset = %format_args!("{:#x}", magic_offset),
-                        magic = %format_args!("{:#x}", magic),
-                        expected = %format_args!("{:#x}", 0x4F48434C56544C32u64),
-                        "VTL2 config magic BEFORE kexec_load"
-                    );
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "could not open /dev/mem to verify config"),
-        }
-    }
-
-    // Load the segments into the kernel.
-    kexec_sys::kexec_load(entry_point, &segments).context("kexec_load failed")?;
-
-    tracing::debug!("kexec loaded, triggering reboot");
-
-    // Reboot into the new kernel. On success this does not return.
-    kexec_sys::kexec_reboot().context("kexec reboot failed")?;
-
-    Ok(())
+/// Legacy entry point. Prefer [prepare_kexec] + [execute_kexec] for
+/// pre-blackout / blackout phase separation.
+pub fn perform_kexec(data: DevServicingData) -> anyhow::Result<()> {
+    let ctx = prepare_kexec(&data.vmlinux, &data.command_line)?;
+    execute_kexec(ctx, data.vmlinux, data.initrd)
 }
 
 /// Size of the device tree buffer. The Linux kernel requires the FDT to fit
