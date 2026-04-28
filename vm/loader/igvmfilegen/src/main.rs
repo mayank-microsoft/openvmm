@@ -426,6 +426,7 @@ trait IgvmfilegenRegister: IgvmLoaderRegister + 'static {
         sidecar: Option<&mut F>,
         command_line: CommandLineType<'_>,
         initrd: Option<(&mut dyn loader::common::ReadSeek, u64)>,
+        custom_binary: Option<(&mut dyn loader::common::ReadSeek, u64)>,
         memory_page_base: Option<u64>,
         memory_page_count: u64,
         vtl0_config: Vtl0Config<'_>,
@@ -468,6 +469,7 @@ impl IgvmfilegenRegister for X86Register {
         sidecar: Option<&mut F>,
         command_line: CommandLineType<'_>,
         initrd: Option<(&mut dyn loader::common::ReadSeek, u64)>,
+        custom_binary: Option<(&mut dyn loader::common::ReadSeek, u64)>,
         memory_page_base: Option<u64>,
         memory_page_count: u64,
         vtl0_config: Vtl0Config<'_>,
@@ -482,6 +484,7 @@ impl IgvmfilegenRegister for X86Register {
             sidecar,
             command_line,
             initrd,
+            custom_binary,
             memory_page_base,
             memory_page_count,
             vtl0_config,
@@ -524,6 +527,7 @@ impl IgvmfilegenRegister for Aarch64Register {
         _sidecar: Option<&mut F>,
         command_line: CommandLineType<'_>,
         initrd: Option<(&mut dyn loader::common::ReadSeek, u64)>,
+        custom_binary: Option<(&mut dyn loader::common::ReadSeek, u64)>,
         memory_page_base: Option<u64>,
         memory_page_count: u64,
         vtl0_config: Vtl0Config<'_>,
@@ -537,6 +541,7 @@ impl IgvmfilegenRegister for Aarch64Register {
             shim,
             command_line,
             initrd,
+            custom_binary,
             memory_page_base,
             memory_page_count,
             vtl0_config,
@@ -613,6 +618,24 @@ fn load_image<'a, R: IgvmfilegenRegister + GuestArch + 'static>(
                 None
             };
 
+            let mut custom_binary_file =
+                if let Some(custom_binary_path) = resources.get(ResourceType::CustomBinary) {
+                    Some(fs_err::File::open(custom_binary_path).context(format!(
+                        "reading custom binary at {}",
+                        custom_binary_path.display()
+                    ))?)
+                } else {
+                    None
+                };
+
+            let custom_binary_info = if let Some(ref mut f) = custom_binary_file {
+                let size = f.seek(std::io::SeekFrom::End(0))?;
+                f.rewind()?;
+                Some((f as &mut dyn loader::common::ReadSeek, size))
+            } else {
+                None
+            };
+
             // TODO: While the paravisor supports multiple things that can be
             // loaded in VTL0, we don't yet have updated file builder config for
             // that.
@@ -660,6 +683,7 @@ fn load_image<'a, R: IgvmfilegenRegister + GuestArch + 'static>(
                 sidecar.as_mut(),
                 command_line,
                 initrd_info,
+                custom_binary_info,
                 memory_page_base,
                 memory_page_count,
                 vtl0_load_config,

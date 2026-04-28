@@ -127,6 +127,7 @@ pub fn load_openhcl_x64<F>(
     sidecar: Option<&mut F>,
     command_line: CommandLineType<'_>,
     mut initrd: Option<(&mut dyn ReadSeek, u64)>,
+    custom_binary: Option<(&mut dyn ReadSeek, u64)>,
     memory_page_base: Option<u64>,
     memory_page_count: u64,
     vtl0_config: Vtl0Config<'_>,
@@ -324,6 +325,31 @@ where
 
         offset += initrd_size;
         Some((initrd_base, initrd_len))
+    } else {
+        None
+    };
+
+    // Optionally import custom binary if specified.
+    let custom_binary_info = if let Some((custom_bin_file, custom_bin_len)) = custom_binary {
+        let custom_bin_base = offset;
+        let custom_bin_size = align_up_to_page_size(custom_bin_len);
+
+        buf.import_file_region(
+            importer,
+            ImportFileRegion {
+                file: custom_bin_file,
+                file_offset: 0,
+                file_length: custom_bin_len,
+                gpa: custom_bin_base,
+                memory_length: custom_bin_len,
+                acceptance: kernel_acceptance,
+                tag: "underhill-custom-binary",
+            },
+        )
+        .map_err(Error::ImportInitrd)?;
+
+        offset += custom_bin_size;
+        Some((custom_bin_base, custom_bin_len))
     } else {
         None
     };
@@ -885,10 +911,17 @@ where
         )
         .map_err(Error::Importer)?;
 
+    let (vtl2_initrd_base, vtl2_initrd_size) = ramdisk.unwrap_or((0, 0));
+    let (vtl2_custom_binary_base, vtl2_custom_binary_size) = custom_binary_info.unwrap_or((0, 0));
+
     let vtl2_measured_config = ParavisorMeasuredVtl2Config {
         magic: ParavisorMeasuredVtl2Config::MAGIC,
         vtom_offset_bit: shared_gpa_boundary_bits.unwrap_or(0),
         padding: [0; 7],
+        initrd_base: vtl2_initrd_base,
+        initrd_size: vtl2_initrd_size,
+        custom_binary_base: vtl2_custom_binary_base,
+        custom_binary_size: vtl2_custom_binary_size,
     };
 
     importer
@@ -945,6 +978,7 @@ pub fn load_openhcl_arm64<F>(
     shim: &mut F,
     command_line: CommandLineType<'_>,
     mut initrd: Option<(&mut dyn ReadSeek, u64)>,
+    custom_binary: Option<(&mut dyn ReadSeek, u64)>,
     memory_page_base: Option<u64>,
     memory_page_count: u64,
     vtl0_config: Vtl0Config<'_>,
@@ -1153,6 +1187,33 @@ where
         &[],
     )?;
     next_addr += heap_size;
+
+    // Optionally import custom binary if specified.
+    let custom_binary_info = if let Some((custom_bin_file, custom_bin_len)) = custom_binary {
+        let custom_bin_base = next_addr;
+        let custom_bin_size = align_up_to_page_size(custom_bin_len);
+
+        let mut custom_buf = ChunkBuf::new();
+        custom_buf
+            .import_file_region(
+                importer,
+                ImportFileRegion {
+                    file: custom_bin_file,
+                    file_offset: 0,
+                    file_length: custom_bin_len,
+                    gpa: custom_bin_base,
+                    memory_length: custom_bin_len,
+                    acceptance: BootPageAcceptance::Exclusive,
+                    tag: "underhill-custom-binary",
+                },
+            )
+            .map_err(Error::ImportInitrd)?;
+
+        next_addr += custom_bin_size;
+        Some((custom_bin_base, custom_bin_len))
+    } else {
+        None
+    };
 
     // The end of memory used by the loader, excluding pagetables.
     let end_of_underhill_mem = next_addr;
@@ -1448,10 +1509,16 @@ where
     )?;
     importer.import_parameter(dt_parameter_area, 0, IgvmParameterType::DeviceTree)?;
 
+    let (vtl2_custom_binary_base, vtl2_custom_binary_size) = custom_binary_info.unwrap_or((0, 0));
+
     let vtl2_measured_config = ParavisorMeasuredVtl2Config {
         magic: ParavisorMeasuredVtl2Config::MAGIC,
         vtom_offset_bit: 0,
         padding: [0; 7],
+        initrd_base: initrd_gpa,
+        initrd_size,
+        custom_binary_base: vtl2_custom_binary_base,
+        custom_binary_size: vtl2_custom_binary_size,
     };
 
     importer

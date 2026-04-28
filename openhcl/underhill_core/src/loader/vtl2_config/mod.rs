@@ -93,6 +93,16 @@ pub struct MeasuredVtl2Info {
     #[inspect(with = "inspect_helpers::accepted_regions")]
     accepted_regions: Vec<MemoryRange>,
     pub vtom_offset_bit: Option<u8>,
+    /// The GPA region of the VTL2 initrd, if present.
+    #[inspect(with = "inspect_helpers::opt_range")]
+    pub initrd_region: Option<MemoryRange>,
+    /// The byte size of the VTL2 initrd.
+    pub initrd_size: u64,
+    /// The GPA region of the custom binary, if present.
+    #[inspect(with = "inspect_helpers::opt_range")]
+    pub custom_binary_region: Option<MemoryRange>,
+    /// The byte size of the custom binary.
+    pub custom_binary_size: u64,
 }
 
 impl MeasuredVtl2Info {
@@ -437,12 +447,98 @@ pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info
         bootshim_log_dropped,
     };
 
+    let initrd_region = if measured_config.initrd_size > 0 {
+        let aligned_size = (measured_config.initrd_size + HV_PAGE_SIZE - 1) & !(HV_PAGE_SIZE - 1);
+        Some(MemoryRange::new(
+            measured_config.initrd_base..measured_config.initrd_base + aligned_size,
+        ))
+    } else {
+        None
+    };
+
+    let custom_binary_region = if measured_config.custom_binary_size > 0 {
+        let aligned_size =
+            (measured_config.custom_binary_size + HV_PAGE_SIZE - 1) & !(HV_PAGE_SIZE - 1);
+        Some(MemoryRange::new(
+            measured_config.custom_binary_base..measured_config.custom_binary_base + aligned_size,
+        ))
+    } else {
+        None
+    };
+
     let measured_vtl2_info = MeasuredVtl2Info {
         accepted_regions,
         vtom_offset_bit,
+        initrd_region,
+        initrd_size: measured_config.initrd_size,
+        custom_binary_region,
+        custom_binary_size: measured_config.custom_binary_size,
     };
 
     Ok((runtime_params, measured_vtl2_info))
+}
+
+/// Result of reading the custom binary and initrd from the IGVM config.
+pub struct CustomBinaryAndInitrd {
+    /// The custom binary data, if present in the IGVM file.
+    pub custom_binary: Option<Vec<u8>>,
+    /// The initrd memory range and byte size, if present.
+    pub initrd: Option<(MemoryRange, u64)>,
+}
+
+/// Reads the custom binary and initrd information from the measured VTL2 config
+/// region in guest physical memory.
+///
+/// This is a standalone function that directly reads from `/dev/mem` using the
+/// config ranges provided by the bootloader, independent of [`read_vtl2_params`].
+pub fn read_custom_binary_and_initrd(
+    config_ranges: &[MemoryRange],
+) -> anyhow::Result<CustomBinaryAndInitrd> {
+    let mapping = Vtl2ParamsMap::new(config_ranges, false)
+        .context("failed to map config region for custom binary/initrd")?;
+
+    let measured_config = mapping
+        .read_plain::<ParavisorMeasuredVtl2Config>(
+            (PARAVISOR_MEASURED_VTL2_CONFIG_PAGE_INDEX * HV_PAGE_SIZE) as usize,
+        )
+        .context("failed to read measured vtl2 config")?;
+
+    assert_eq!(measured_config.magic, ParavisorMeasuredVtl2Config::MAGIC);
+
+    drop(mapping);
+
+    let initrd = if measured_config.initrd_size > 0 {
+        let aligned_size = (measured_config.initrd_size + HV_PAGE_SIZE - 1) & !(HV_PAGE_SIZE - 1);
+        let range = MemoryRange::new(
+            measured_config.initrd_base..measured_config.initrd_base + aligned_size,
+        );
+        Some((range, measured_config.initrd_size))
+    } else {
+        None
+    };
+
+    let custom_binary = if measured_config.custom_binary_size > 0 {
+        let aligned_size =
+            (measured_config.custom_binary_size + HV_PAGE_SIZE - 1) & !(HV_PAGE_SIZE - 1);
+        let range = MemoryRange::new(
+            measured_config.custom_binary_base..measured_config.custom_binary_base + aligned_size,
+        );
+        let ranges = [range];
+        let bin_mapping =
+            Vtl2ParamsMap::new(&ranges, false).context("failed to map custom binary region")?;
+        let mut data = vec![0u8; measured_config.custom_binary_size as usize];
+        bin_mapping
+            .read_at(0, &mut data)
+            .context("failed to read custom binary data")?;
+        Some(data)
+    } else {
+        None
+    };
+
+    Ok(CustomBinaryAndInitrd {
+        custom_binary,
+        initrd,
+    })
 }
 
 mod inspect_helpers {
@@ -454,5 +550,9 @@ mod inspect_helpers {
                 .iter()
                 .map(|region| (region, inspect::AsDebug(region))), // TODO ??
         )
+    }
+
+    pub(super) fn opt_range(range: &Option<MemoryRange>) -> impl Inspect + '_ {
+        inspect::AsDebug(range)
     }
 }

@@ -16,6 +16,9 @@ mod inspect_internal;
 mod inspect_proc;
 mod livedump;
 mod loader;
+
+pub use loader::vtl2_config::CustomBinaryAndInitrd;
+pub use loader::vtl2_config::read_custom_binary_and_initrd;
 mod nvme_manager;
 mod options;
 mod reference_time;

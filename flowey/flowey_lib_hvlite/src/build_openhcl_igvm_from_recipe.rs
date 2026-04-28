@@ -73,6 +73,7 @@ pub struct OpenhclIgvmRecipeDetailsLocalOnly {
     pub custom_openhcl_boot: Option<PathBuf>,
     pub custom_kernel: Option<PathBuf>,
     pub custom_sidecar: Option<PathBuf>,
+    pub custom_binary: Option<PathBuf>,
     pub custom_extra_rootfs: Vec<PathBuf>,
 }
 
@@ -313,6 +314,7 @@ impl SimpleFlowNode for Node {
             custom_openhcl_boot,
             custom_kernel,
             custom_sidecar,
+            custom_binary,
             custom_extra_rootfs,
         } = local_only.unwrap_or(OpenhclIgvmRecipeDetailsLocalOnly {
             openvmm_hcl_no_strip: false,
@@ -321,6 +323,7 @@ impl SimpleFlowNode for Node {
             custom_openhcl_boot: None,
             custom_kernel: None,
             custom_sidecar: None,
+            custom_binary: None,
             custom_extra_rootfs: Vec::new(),
         });
 
@@ -596,6 +599,8 @@ impl SimpleFlowNode for Node {
             let sidecar_bin = sidecar_bin.claim(ctx);
             let uefi_resource = uefi_resource.claim(ctx);
             let vtl0_kernel_resource = vtl0_kernel_resource.claim(ctx);
+            let custom_binary = custom_binary.map(ReadVar::from_static);
+            let custom_binary = custom_binary.map(|v| v.claim(ctx));
             |rt| {
                 let mut resources = BTreeMap::<ResourceType, PathBuf>::new();
                 resources.insert(ResourceType::UnderhillKernel, rt.read(kernel));
@@ -609,6 +614,9 @@ impl SimpleFlowNode for Node {
                 }
                 if let Some(vtl0_kernel_resource) = vtl0_kernel_resource {
                     vtl0_kernel_resource.add_to_resources(&mut resources, rt);
+                }
+                if let Some(custom_binary) = custom_binary {
+                    resources.insert(ResourceType::CustomBinary, rt.read(custom_binary));
                 }
                 resources
             }

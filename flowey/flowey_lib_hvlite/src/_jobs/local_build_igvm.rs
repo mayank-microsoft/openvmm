@@ -25,6 +25,7 @@ use crate::run_igvmfilegen::IgvmOutput;
 #[derive(Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Customizations {
     pub build_label: Option<String>,
+    pub custom_binary: Option<PathBuf>,
     pub custom_directory: Vec<PathBuf>,
     pub custom_kernel: Option<PathBuf>,
     pub custom_layer: Vec<PathBuf>,
@@ -82,6 +83,7 @@ impl SimpleFlowNode for Node {
 
         let Customizations {
             build_label,
+            custom_binary,
             custom_directory,
             custom_kernel,
             custom_layer,
@@ -159,6 +161,7 @@ impl SimpleFlowNode for Node {
                 custom_openhcl_boot: custom_openhcl_boot.map(|p| p.absolute()).transpose()?,
                 custom_kernel: custom_kernel.map(|p| p.absolute()).transpose()?,
                 custom_sidecar: custom_sidecar.map(|p| p.absolute()).transpose()?,
+                custom_binary: custom_binary.map(|p| p.absolute()).transpose()?,
                 custom_extra_rootfs: custom_extra_rootfs
                     .into_iter()
                     .map(|p| p.absolute())

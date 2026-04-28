@@ -367,9 +367,96 @@ pub struct ParavisorMeasuredVtl2Config {
     pub vtom_offset_bit: u8,
     /// Padding.
     pub padding: [u8; 7],
+    /// The GPA base address of the VTL2 initrd. 0 if not present.
+    pub initrd_base: u64,
+    /// The byte size of the VTL2 initrd. 0 if not present.
+    pub initrd_size: u64,
+    /// The GPA base address of the custom binary. 0 if not present.
+    pub custom_binary_base: u64,
+    /// The byte size of the custom binary. 0 if not present.
+    pub custom_binary_size: u64,
 }
 
 impl ParavisorMeasuredVtl2Config {
     /// Magic value for the measured config, which is "OHCLVTL2".
     pub const MAGIC: u64 = 0x4F48434C56544C32;
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use std::vec;
+
+    use super::*;
+    use zerocopy::FromBytes;
+    use zerocopy::IntoBytes;
+
+    #[test]
+    fn measured_vtl2_config_fits_in_page() {
+        assert!(
+            size_of::<ParavisorMeasuredVtl2Config>() <= HV_PAGE_SIZE as usize,
+            "ParavisorMeasuredVtl2Config must fit in a single page"
+        );
+    }
+
+    #[test]
+    fn measured_vtl2_config_magic() {
+        assert_eq!(ParavisorMeasuredVtl2Config::MAGIC, 0x4F48434C56544C32);
+    }
+
+    #[test]
+    fn measured_vtl2_config_round_trip() {
+        let config = ParavisorMeasuredVtl2Config {
+            magic: ParavisorMeasuredVtl2Config::MAGIC,
+            vtom_offset_bit: 42,
+            padding: [0; 7],
+            initrd_base: 0x1000_0000,
+            initrd_size: 0x2000,
+            custom_binary_base: 0x3000_0000,
+            custom_binary_size: 0x500,
+        };
+
+        let bytes = config.as_bytes();
+        let restored = ParavisorMeasuredVtl2Config::read_from_bytes(bytes).unwrap();
+
+        assert_eq!(restored.magic, ParavisorMeasuredVtl2Config::MAGIC);
+        assert_eq!(restored.vtom_offset_bit, 42);
+        assert_eq!(restored.initrd_base, 0x1000_0000);
+        assert_eq!(restored.initrd_size, 0x2000);
+        assert_eq!(restored.custom_binary_base, 0x3000_0000);
+        assert_eq!(restored.custom_binary_size, 0x500);
+    }
+
+    #[test]
+    fn measured_vtl2_config_defaults_to_zero() {
+        let config = ParavisorMeasuredVtl2Config {
+            magic: ParavisorMeasuredVtl2Config::MAGIC,
+            vtom_offset_bit: 0,
+            padding: [0; 7],
+            initrd_base: 0,
+            initrd_size: 0,
+            custom_binary_base: 0,
+            custom_binary_size: 0,
+        };
+
+        assert_eq!(config.initrd_base, 0);
+        assert_eq!(config.initrd_size, 0);
+        assert_eq!(config.custom_binary_base, 0);
+        assert_eq!(config.custom_binary_size, 0);
+    }
+
+    #[test]
+    fn measured_vtl2_config_zero_bytes_backward_compat() {
+        // Simulate reading an old IGVM file where new fields are zero
+        let mut bytes = vec![0u8; size_of::<ParavisorMeasuredVtl2Config>()];
+        // Write magic
+        bytes[0..8].copy_from_slice(&ParavisorMeasuredVtl2Config::MAGIC.to_le_bytes());
+
+        let config = ParavisorMeasuredVtl2Config::read_from_bytes(&bytes).unwrap();
+        assert_eq!(config.magic, ParavisorMeasuredVtl2Config::MAGIC);
+        assert_eq!(config.initrd_base, 0);
+        assert_eq!(config.initrd_size, 0);
+        assert_eq!(config.custom_binary_base, 0);
+        assert_eq!(config.custom_binary_size, 0);
+    }
 }
