@@ -6,6 +6,7 @@
 
 use self::msg::Msg;
 use crate::api::GuestSaveRequest;
+use crate::api::GuestDrivenServicingRequest;
 use crate::client::ModifyVtl2SettingsRequest;
 use crate::error::IgvmAttestError;
 use crate::error::TryIntoProtocolBool;
@@ -157,6 +158,7 @@ fn is_secondary_host_request(request: HostRequests) -> bool {
 
 pub(crate) mod msg {
     use crate::api::GuestSaveRequest;
+    use crate::api::GuestDrivenServicingRequest;
     use crate::client::ModifyVtl2SettingsRequest;
     use chipset_resources::battery::HostBatteryUpdate;
     use guid::Guid;
@@ -242,6 +244,8 @@ pub(crate) mod msg {
         ///
         /// CVM NOTE: Servicing is not yet supported, any requests will be rejected.
         TakeSaveRequestReceiver(Rpc<(), Option<mesh::Receiver<GuestSaveRequest>>>),
+        /// Take the late-bound receiver for guest-driven servicing requests.
+        TakeGuestDrivenServicingReceiver(Rpc<(), Option<mesh::Receiver<GuestDrivenServicingRequest>>>),
         /// Take the late-bound receiver for updating dynamic Vtl2 settings.
         /// This is used to inform Underhill of changes to attached storage and
         /// networking devices and their settings.
@@ -307,6 +311,8 @@ pub(crate) mod msg {
         /// Send saved state (or an error message) to the host so it can be used to start
         /// a new VM after servicing.
         SendServicingState(Rpc<Result<Vec<u8>, String>, Result<(), ()>>),
+        /// Send the result of guest-driven servicing back to the host.
+        SendGuestDrivenServicingResult(Rpc<bool, Result<(), ()>>),
         /// Tell the host to unmap the framebuffer.
         UnmapFramebuffer(Rpc<(), Protocol<get_protocol::UnmapFramebufferResponse>>),
         /// Read a PCI config space value from the proxied VGA device.
@@ -545,6 +551,8 @@ pub(crate) struct ProcessLoop<T: RingMem> {
 
     guest_notification_listeners: GuestNotificationListeners,
     #[inspect(skip)]
+    igvm_accumulator: Vec<u8>,
+    #[inspect(skip)]
     guest_notification_responses:
         FuturesUnordered<Pin<Box<dyn Send + Future<Output = GuestNotificationResponse>>>>,
 }
@@ -559,6 +567,7 @@ struct GuestNotificationListeners {
     #[inspect(skip)]
     vpci: HashMap<Guid, mesh::Sender<VpciBusEvent>>,
     battery_status: GuestNotificationSender<HostBatteryUpdate>,
+    guest_driven_servicing: GuestNotificationSender<GuestDrivenServicingRequest>,
 }
 
 // DEVNOTE: The fact that we even have a notion of "guest notification
@@ -740,10 +749,12 @@ impl<T: RingMem> ProcessLoop<T> {
             read_send,
             write_recv,
             secondary_host_requests_read_send,
+            igvm_accumulator: Vec::new(),
             guest_notification_listeners: GuestNotificationListeners {
                 generation_id: GuestNotificationSender::new(),
                 vtl2_settings: GuestNotificationSender::new(),
                 save_request: GuestNotificationSender::new(),
+                guest_driven_servicing: GuestNotificationSender::new(),
                 vpci: HashMap::new(),
                 battery_status: GuestNotificationSender::new(),
             },
@@ -1113,6 +1124,14 @@ impl<T: RingMem> ProcessLoop<T> {
                         get_protocol::GuestNotifications::SAVE_GUEST_VTL2_STATE,
                     ))
             }),
+            Msg::TakeGuestDrivenServicingReceiver(req) => req.handle_sync(|()| {
+                self.guest_notification_listeners
+                    .guest_driven_servicing
+                    .init_receiver()
+                    .map(log_buffered_guest_notifications(
+                        get_protocol::GuestNotifications::SEND_IGVM_TO_GUEST,
+                    ))
+            }),
             Msg::TakeBatteryStatusReceiver(req) => req.handle_sync(|()| {
                 self.guest_notification_listeners
                     .battery_status
@@ -1253,6 +1272,12 @@ impl<T: RingMem> ProcessLoop<T> {
                     request_send_servicing_state(access, data).await
                 })
             }),
+            Msg::SendGuestDrivenServicingResult(req) => {
+                req.handle_sync(|success| {
+                    tracing::info!(success, "guest-driven servicing result");
+                    Ok(())
+                });
+            },
             Msg::CompleteStartVtl0(rpc) => {
                 let (input, res) = rpc.split();
                 self.complete_start_vtl0(input)?;
@@ -1361,6 +1386,9 @@ impl<T: RingMem> ProcessLoop<T> {
             GuestNotifications::NOTIFY_POST_LIVE_MIGRATION => {
                 self.handle_post_live_migration_notification(read_guest_notification(id, buf)?);
             }
+            GuestNotifications::SEND_IGVM_TO_GUEST => {
+                self.handle_send_igvm_to_guest_notification(buf)?;
+            }
             invalid_notification => {
                 tracing::error!(
                     ?invalid_notification,
@@ -1432,7 +1460,42 @@ impl<T: RingMem> ProcessLoop<T> {
             })
     }
 
-    fn handle_modify_vtl2_settings_notification(&mut self, buf: &[u8]) -> Result<(), FatalError> {
+    fn handle_send_igvm_to_guest_notification(&mut self, buf: &[u8]) -> Result<(), FatalError> {
+        let (notification, remaining) =
+            get_protocol::SendIgvmToGuestNotification::read_from_prefix(buf).map_err(|_| {
+                FatalError::MessageSizeGuestNotification {
+                    len: buf.len(),
+                    notification: get_protocol::GuestNotifications::SEND_IGVM_TO_GUEST,
+                }
+            })?;
+
+        let chunk_len = notification.data_length as usize;
+        let chunk_data = &remaining[..chunk_len];
+
+        // Accumulate IGVM chunks
+        self.igvm_accumulator.extend_from_slice(chunk_data);
+
+        // If this is the last chunk, send the complete IGVM to the dispatch layer
+        let status = { notification.status };
+        if status == get_protocol::GuestDrivenServicingStatus::SUCCESS {
+            let igvm_data = std::mem::take(&mut self.igvm_accumulator);
+            self.guest_notification_listeners
+                .guest_driven_servicing
+                .send(GuestDrivenServicingRequest {
+                    correlation_id: notification.correlation_id,
+                    igvm_data,
+                })
+                .map_err(|_| {
+                    FatalError::TooManyGuestNotifications(
+                        get_protocol::GuestNotifications::SEND_IGVM_TO_GUEST,
+                    )
+                })?;
+        }
+
+        Ok(())
+    }
+
+        fn handle_modify_vtl2_settings_notification(&mut self, buf: &[u8]) -> Result<(), FatalError> {
         let (request, remaining) =
             get_protocol::ModifyVtl2SettingsNotification::read_from_prefix(buf).map_err(|_| {
                 FatalError::MessageSizeGuestNotification {

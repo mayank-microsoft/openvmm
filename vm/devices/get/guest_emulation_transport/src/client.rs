@@ -4,6 +4,7 @@
 use super::process_loop::msg;
 use super::process_loop::msg::IgvmAttestRequestData;
 use crate::api::GuestSaveRequest;
+use crate::api::GuestDrivenServicingRequest;
 use crate::api::platform_settings;
 use chipset_resources::battery::HostBatteryUpdate;
 use cvm_tracing::CVM_ALLOWED;
@@ -779,6 +780,26 @@ impl GuestEmulationTransportClient {
         self.control
             .call(msg::Msg::TakeSaveRequestReceiver, ())
             .await
+    }
+
+    /// Take the guest-driven servicing request receiver, which allows the VM
+    /// to respond to host-sent IGVM data for guest-driven servicing.
+    /// Returns `None` if the channel has already been taken.
+    pub async fn take_guest_driven_servicing_recv(&self) -> Option<mesh::Receiver<GuestDrivenServicingRequest>> {
+        self.control
+            .call(msg::Msg::TakeGuestDrivenServicingReceiver, ())
+            .await
+    }
+
+    /// Sends a guest-driven servicing result back to the host.
+    pub async fn send_guest_driven_servicing_result(
+        &self,
+        success: bool,
+    ) -> Result<(), crate::error::SaveRestoreOperationFailure> {
+        self.control
+            .call(msg::Msg::SendGuestDrivenServicingResult, success)
+            .await
+            .map_err(|()| crate::error::SaveRestoreOperationFailure {})
     }
 
     /// Sends servicing state to the host.

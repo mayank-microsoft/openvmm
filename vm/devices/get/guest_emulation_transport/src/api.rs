@@ -289,3 +289,14 @@ pub struct GuestSaveRequest {
     #[mesh(encoding = "mesh::payload::encoding::ZeroCopyEncoding")]
     pub capabilities_flags: SaveGuestVtl2StateFlags,
 }
+
+
+/// Request for guest-driven servicing. The host sends the IGVM file
+/// to the guest, and the guest handles servicing internally.
+#[derive(MeshPayload)]
+pub struct GuestDrivenServicingRequest {
+    /// GUID associated with the request.
+    pub correlation_id: Guid,
+    /// The complete IGVM file data.
+    pub igvm_data: Vec<u8>,
+}

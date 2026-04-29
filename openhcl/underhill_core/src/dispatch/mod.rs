@@ -28,6 +28,7 @@ use futures::StreamExt;
 use futures_concurrency::future::Join;
 use get_protocol::SaveGuestVtl2StateFlags;
 use guest_emulation_transport::api::GuestSaveRequest;
+use guest_emulation_transport::api::GuestDrivenServicingRequest;
 use guid::Guid;
 use hyperv_ic_resources::shutdown::ShutdownParams;
 use hyperv_ic_resources::shutdown::ShutdownResult;
@@ -256,6 +257,12 @@ impl LoadedVm {
             .await
             .expect("no failure");
 
+        let mut guest_driven_recv = self
+            .get_client
+            .take_guest_driven_servicing_recv()
+            .await
+            .expect("no failure");
+
         struct PendingShutdown {
             guest_response: PendingRpc<ShutdownResult>,
             send_result: Rpc<(), ShutdownResult>,
@@ -272,6 +279,7 @@ impl LoadedVm {
                 UhVmRpc(UhVmRpc),
                 VtlCrash(VtlCrash),
                 ServicingRequest(GuestSaveRequest),
+                GuestDrivenServicing(GuestDrivenServicingRequest),
                 ShutdownRequest(Rpc<ShutdownParams, ShutdownResult>),
                 ShutdownResponse(<PendingRpc<ShutdownResult> as Future>::Output),
                 VpciRelayReady,
@@ -283,6 +291,7 @@ impl LoadedVm {
                 message = vm_rpc.select_next_some() => Event::UhVmRpc(message),
                 message = self.crash_notification_recv.select_next_some() => Event::VtlCrash(message),
                 message = save_request_recv.select_next_some() => Event::ServicingRequest(message),
+                message = guest_driven_recv.select_next_some() => Event::GuestDrivenServicing(message),
                 _ = async {
                     if let Some(vpci_relay) = &mut self.vpci_relay {
                         vpci_relay.wait_ready().await
@@ -491,6 +500,147 @@ impl LoadedVm {
                             // This is not recoverable, so tear down.
                             break None;
                         }
+                    }
+                }
+                Event::GuestDrivenServicing(message) => {
+                    tracing::info!(
+                        CVM_ALLOWED,
+                        correlation_id = %message.correlation_id,
+                        igvm_size = message.igvm_data.len(),
+                        "guest-driven servicing: IGVM received, parsing..."
+                    );
+
+                    let success = match igvm::IgvmFile::new_from_binary(&message.igvm_data, None) {
+                        Ok(igvm_file) => {
+                            use std::collections::hash_map::DefaultHasher;
+                            use std::hash::{Hash, Hasher};
+
+                            // Find the ParavisorMeasuredVtl2Config to get initrd/binary GPA ranges.
+                            // It's stored at PARAVISOR_MEASURED_VTL2_CONFIG_PAGE_INDEX in the config area.
+                            // For now, scan all PageData entries and collect by GPA ranges.
+                            let directives = igvm_file.directives();
+                            let mut page_count: u64 = 0;
+                            let mut min_gpa: u64 = u64::MAX;
+                            let mut max_gpa: u64 = 0;
+                            let mut total_data_bytes: u64 = 0;
+
+                            // Collect all page data GPAs and sizes
+                            let mut page_entries: Vec<(u64, usize)> = Vec::new();
+                            for directive in directives {
+                                if let igvm::IgvmDirectiveHeader::PageData { gpa, data, .. } = directive {
+                                    page_count += 1;
+                                    total_data_bytes += data.len() as u64;
+                                    if *gpa < min_gpa { min_gpa = *gpa; }
+                                    if *gpa > max_gpa { max_gpa = *gpa; }
+                                    page_entries.push((*gpa, data.len()));
+                                }
+                            }
+
+                            // Hash the full IGVM data
+                            let mut hasher = DefaultHasher::new();
+                            message.igvm_data.hash(&mut hasher);
+                            let full_hash = hasher.finish();
+
+                            // Try to find initrd and kernel by looking at the
+                            // measured config. The measured config is at a known
+                            // page in the IGVM. Look for it by scanning for the
+                            // MAGIC value 0x4F48434C56544C32 ("OHCLVTL2").
+                            let mut initrd_hash_str = String::from("not found");
+                            let mut kernel_hash_str = String::from("not found");
+                            let mut initrd_size_found: u64 = 0;
+                            let mut kernel_size_found: u64 = 0;
+
+                            for directive in directives {
+                                if let igvm::IgvmDirectiveHeader::PageData { data, .. } = directive {
+                                    if data.len() >= 48 {
+                                        let magic = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0;8]));
+                                        if magic == 0x4F48434C56544C32 {
+                                            // Found ParavisorMeasuredVtl2Config!
+                                            let initrd_base = u64::from_le_bytes(data[16..24].try_into().unwrap_or([0;8]));
+                                            let initrd_size = u64::from_le_bytes(data[24..32].try_into().unwrap_or([0;8]));
+                                            let custom_binary_base = u64::from_le_bytes(data[32..40].try_into().unwrap_or([0;8]));
+                                            let custom_binary_size = u64::from_le_bytes(data[40..48].try_into().unwrap_or([0;8]));
+
+                                            tracing::info!(
+                                                CVM_ALLOWED,
+                                                initrd_base = format!("{:#x}", initrd_base),
+                                                initrd_size,
+                                                custom_binary_base = format!("{:#x}", custom_binary_base),
+                                                custom_binary_size,
+                                                "found ParavisorMeasuredVtl2Config"
+                                            );
+
+                                            // Hash initrd pages
+                                            if initrd_size > 0 {
+                                                let mut ih = DefaultHasher::new();
+                                                let mut ib: u64 = 0;
+                                                for d in directives {
+                                                    if let igvm::IgvmDirectiveHeader::PageData { gpa, data, .. } = d {
+                                                        if *gpa >= initrd_base && *gpa < initrd_base + initrd_size {
+                                                            data.hash(&mut ih);
+                                                            ib += data.len() as u64;
+                                                        }
+                                                    }
+                                                }
+                                                initrd_size_found = ib;
+                                                initrd_hash_str = format!("{:#018x}", ih.finish());
+                                            }
+
+                                            // Hash custom binary pages
+                                            if custom_binary_size > 0 {
+                                                let mut kh = DefaultHasher::new();
+                                                let mut kb: u64 = 0;
+                                                for d in directives {
+                                                    if let igvm::IgvmDirectiveHeader::PageData { gpa, data, .. } = d {
+                                                        if *gpa >= custom_binary_base && *gpa < custom_binary_base + custom_binary_size {
+                                                            data.hash(&mut kh);
+                                                            kb += data.len() as u64;
+                                                        }
+                                                    }
+                                                }
+                                                kernel_size_found = kb;
+                                                kernel_hash_str = format!("{:#018x}", kh.finish());
+                                            }
+
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            tracing::info!(
+                                CVM_ALLOWED,
+                                igvm_size = message.igvm_data.len(),
+                                igvm_hash = format!("{:#018x}", full_hash),
+                                page_count,
+                                total_data_bytes,
+                                gpa_range = format!("{:#x}-{:#x}", min_gpa, max_gpa),
+                                initrd_hash = initrd_hash_str,
+                                initrd_size = initrd_size_found,
+                                binary_hash = kernel_hash_str,
+                                binary_size = kernel_size_found,
+                                "guest-driven servicing: IGVM parsed successfully"
+                            );
+
+                            true
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                CVM_ALLOWED,
+                                error = %e,
+                                igvm_size = message.igvm_data.len(),
+                                "guest-driven servicing: failed to parse IGVM"
+                            );
+                            false
+                        }
+                    };
+
+                    if let Err(e) = self.get_client.send_guest_driven_servicing_result(success).await {
+                        tracing::error!(
+                            CVM_ALLOWED,
+                            error = ?e,
+                            "failed to send guest-driven servicing result"
+                        );
                     }
                 }
                 Event::ShutdownRequest(rpc) => {

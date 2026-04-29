@@ -96,6 +96,7 @@ open_enum! {
         BATTERY_STATUS = 7,
         INJECT_DEBUG_INTERRUPT = 8,
         NOTIFY_POST_LIVE_MIGRATION = 9,
+        SEND_IGVM_TO_GUEST = 10,
     }
 }
 
@@ -158,6 +159,7 @@ open_enum! {
         DEVICE_PLATFORM_SETTINGS_V2_REV1 = 27, // wart: only sent back in *response* to DEVICE_PLATFORM_SETTINGS
         CREATE_RAM_GPA_RANGE             = 28,
         RESET_RAM_GPA_RANGE              = 29,
+        SEND_IGVM_TO_GUEST               = 30,
 
         // --- Experimental (not yet in Hyper-V) ---
         MAP_FRAMEBUFFER              = 0xFFFF,
@@ -1894,6 +1896,60 @@ impl ResetRamGpaRangeResponse {
         }
     }
 }
+
+
+/// Status codes for guest-driven servicing results.
+open_enum! {
+    #[derive(IntoBytes, FromBytes, Immutable, KnownLayout)]
+    pub enum GuestDrivenServicingStatus: u16 {
+        SUCCESS = 0,
+        FAILURE = 1,
+        MORE_DATA = 2,
+    }
+}
+
+/// Notification sent to the guest to initiate guest-driven servicing.
+/// IGVM data is sent in chunks; the last chunk has status SUCCESS, intermediate chunks have MORE_DATA.
+#[repr(C, packed)]
+#[derive(Copy, Clone, Debug, IntoBytes, FromBytes, Immutable, KnownLayout)]
+pub struct SendIgvmToGuestNotification {
+    pub message_header: HeaderGuestNotification,
+    pub correlation_id: Guid,
+    pub status: GuestDrivenServicingStatus,
+    pub total_igvm_size: u32,
+    pub data_length: u32,
+    // Variable-length IGVM payload chunk follows.
+}
+
+impl SendIgvmToGuestNotification {
+    pub fn new(correlation_id: Guid, status: GuestDrivenServicingStatus, total_igvm_size: u32, data_length: u32) -> Self {
+        Self {
+            message_header: HeaderGeneric::new(GuestNotifications::SEND_IGVM_TO_GUEST),
+            correlation_id,
+            status,
+            total_igvm_size,
+            data_length,
+        }
+    }
+}
+
+/// Response from the guest indicating guest-driven servicing result.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, IntoBytes, FromBytes, Immutable, KnownLayout)]
+pub struct SendIgvmToGuestResponse {
+    pub message_header: HeaderHostRequest,
+    pub status: GuestDrivenServicingStatus,
+}
+
+impl SendIgvmToGuestResponse {
+    pub fn new(status: GuestDrivenServicingStatus) -> Self {
+        Self {
+            message_header: HeaderGeneric::new(HostRequests::SEND_IGVM_TO_GUEST),
+            status,
+        }
+    }
+}
+
 
 pub mod test_utilities {
     // These constants are shared across GED and GET testing
