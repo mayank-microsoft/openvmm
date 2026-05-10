@@ -507,129 +507,22 @@ impl LoadedVm {
                         CVM_ALLOWED,
                         correlation_id = %message.correlation_id,
                         igvm_size = message.igvm_data.len(),
-                        "guest-driven servicing: IGVM received, parsing..."
+                        "guest-driven servicing: IGVM received, starting kexec flow"
                     );
 
-                    let success = match igvm::IgvmFile::new_from_binary(&message.igvm_data, None) {
-                        Ok(igvm_file) => {
-                            use std::collections::hash_map::DefaultHasher;
-                            use std::hash::{Hash, Hasher};
+                    let result = self.handle_guest_driven_kexec(&message.igvm_data).await;
 
-                            // Find the ParavisorMeasuredVtl2Config to get initrd/binary GPA ranges.
-                            // It's stored at PARAVISOR_MEASURED_VTL2_CONFIG_PAGE_INDEX in the config area.
-                            // For now, scan all PageData entries and collect by GPA ranges.
-                            let directives = igvm_file.directives();
-                            let mut page_count: u64 = 0;
-                            let mut min_gpa: u64 = u64::MAX;
-                            let mut max_gpa: u64 = 0;
-                            let mut total_data_bytes: u64 = 0;
-
-                            // Collect all page data GPAs and sizes
-                            let mut page_entries: Vec<(u64, usize)> = Vec::new();
-                            for directive in directives {
-                                if let igvm::IgvmDirectiveHeader::PageData { gpa, data, .. } = directive {
-                                    page_count += 1;
-                                    total_data_bytes += data.len() as u64;
-                                    if *gpa < min_gpa { min_gpa = *gpa; }
-                                    if *gpa > max_gpa { max_gpa = *gpa; }
-                                    page_entries.push((*gpa, data.len()));
-                                }
-                            }
-
-                            // Hash the full IGVM data
-                            let mut hasher = DefaultHasher::new();
-                            message.igvm_data.hash(&mut hasher);
-                            let full_hash = hasher.finish();
-
-                            // Try to find initrd and kernel by looking at the
-                            // measured config. The measured config is at a known
-                            // page in the IGVM. Look for it by scanning for the
-                            // MAGIC value 0x4F48434C56544C32 ("OHCLVTL2").
-                            let mut initrd_hash_str = String::from("not found");
-                            let mut kernel_hash_str = String::from("not found");
-                            let mut initrd_size_found: u64 = 0;
-                            let mut kernel_size_found: u64 = 0;
-
-                            for directive in directives {
-                                if let igvm::IgvmDirectiveHeader::PageData { data, .. } = directive {
-                                    if data.len() >= 48 {
-                                        let magic = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0;8]));
-                                        if magic == 0x4F48434C56544C32 {
-                                            // Found ParavisorMeasuredVtl2Config!
-                                            let initrd_base = u64::from_le_bytes(data[16..24].try_into().unwrap_or([0;8]));
-                                            let initrd_size = u64::from_le_bytes(data[24..32].try_into().unwrap_or([0;8]));
-                                            let custom_binary_base = u64::from_le_bytes(data[32..40].try_into().unwrap_or([0;8]));
-                                            let custom_binary_size = u64::from_le_bytes(data[40..48].try_into().unwrap_or([0;8]));
-
-                                            tracing::info!(
-                                                CVM_ALLOWED,
-                                                initrd_base = format!("{:#x}", initrd_base),
-                                                initrd_size,
-                                                custom_binary_base = format!("{:#x}", custom_binary_base),
-                                                custom_binary_size,
-                                                "found ParavisorMeasuredVtl2Config"
-                                            );
-
-                                            // Hash initrd pages
-                                            if initrd_size > 0 {
-                                                let mut ih = DefaultHasher::new();
-                                                let mut ib: u64 = 0;
-                                                for d in directives {
-                                                    if let igvm::IgvmDirectiveHeader::PageData { gpa, data, .. } = d {
-                                                        if *gpa >= initrd_base && *gpa < initrd_base + initrd_size {
-                                                            data.hash(&mut ih);
-                                                            ib += data.len() as u64;
-                                                        }
-                                                    }
-                                                }
-                                                initrd_size_found = ib;
-                                                initrd_hash_str = format!("{:#018x}", ih.finish());
-                                            }
-
-                                            // Hash custom binary pages
-                                            if custom_binary_size > 0 {
-                                                let mut kh = DefaultHasher::new();
-                                                let mut kb: u64 = 0;
-                                                for d in directives {
-                                                    if let igvm::IgvmDirectiveHeader::PageData { gpa, data, .. } = d {
-                                                        if *gpa >= custom_binary_base && *gpa < custom_binary_base + custom_binary_size {
-                                                            data.hash(&mut kh);
-                                                            kb += data.len() as u64;
-                                                        }
-                                                    }
-                                                }
-                                                kernel_size_found = kb;
-                                                kernel_hash_str = format!("{:#018x}", kh.finish());
-                                            }
-
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-
-                            tracing::info!(
-                                CVM_ALLOWED,
-                                igvm_size = message.igvm_data.len(),
-                                igvm_hash = format!("{:#018x}", full_hash),
-                                page_count,
-                                total_data_bytes,
-                                gpa_range = format!("{:#x}-{:#x}", min_gpa, max_gpa),
-                                initrd_hash = initrd_hash_str,
-                                initrd_size = initrd_size_found,
-                                binary_hash = kernel_hash_str,
-                                binary_size = kernel_size_found,
-                                "guest-driven servicing: IGVM parsed successfully"
-                            );
-
+                    let success = match &result {
+                        Ok(()) => {
+                            // kexec_reboot succeeded  this code is unreachable
+                            // because kexec_reboot does not return on success.
                             true
                         }
                         Err(e) => {
                             tracing::error!(
                                 CVM_ALLOWED,
                                 error = %e,
-                                igvm_size = message.igvm_data.len(),
-                                "guest-driven servicing: failed to parse IGVM"
+                                "guest-driven kexec servicing failed"
                             );
                             false
                         }
@@ -728,6 +621,124 @@ impl LoadedVm {
     /// Returns `true` if servicing was successful (in which case the VM will be
     /// terminated any moment), `false` if it failed non-destructively the VM
     /// should keep running.
+
+    /// Handle a guest-driven kexec servicing request.
+    ///
+    /// Extracts vmlinuz + initrd from the IGVM, performs blackout
+    /// (stop/save/shutdown), serializes state into the initrd, and
+    /// calls kexec_file_load + kexec_reboot. Does not return on success.
+    async fn handle_guest_driven_kexec(
+        &mut self,
+        igvm_data: &[u8],
+    ) -> anyhow::Result<()> {
+        use crate::guest_kexec;
+        use anyhow::Context;
+
+        // Parse IGVM and extract vmlinuz + initrd (pre-blackout, safe to fail)
+        let parsed = guest_kexec::parse_igvm_for_kexec(igvm_data)
+            .context("failed to parse IGVM for kexec")?;
+        let vmlinuz = parsed.vmlinuz;
+        let mut initrd = parsed.initrd;
+
+        // --- BLACKOUT PHASE ---
+        let was_running = self.stop().await;
+        tracing::info!(CVM_ALLOWED, was_running, "blackout: VPs stopped");
+
+        let saved_state = match self
+            .save(None, KeepAliveConfig::Disabled, KeepAliveConfig::Disabled)
+            .await
+        {
+            Ok(state) => state,
+            Err(err) => {
+                tracing::error!(CVM_ALLOWED, error = %err, "blackout: save failed, recovering");
+                if was_running {
+                    self.start(None).await;
+                }
+                return Err(err);
+            }
+        };
+
+        // Write persisted info for boot shim
+        let nvme_vp_interrupt_state =
+            crate::nvme_manager::save_restore_helpers::nvme_interrupt_state(
+                saved_state.init_state.nvme_state.as_ref().map(|n| &n.nvme_state),
+            );
+        crate::loader::vtl2_config::write_persisted_info(
+            self.runtime_params.parsed_openhcl_boot(),
+            nvme_vp_interrupt_state,
+        )
+        .context("failed to write persisted info for kexec")?;
+
+        // Shutdown devices in parallel
+        let shutdown_mana = async {
+            if let Some(network_settings) = self.network_settings.as_mut() {
+                network_settings
+                    .unload_for_servicing()
+                    .instrument(tracing::info_span!("kexec_shutdown_mana"))
+                    .await;
+            }
+        };
+        let shutdown_nvme = async {
+            if let Some(nvme_manager) = self.nvme_manager.take() {
+                nvme_manager
+                    .shutdown(false)
+                    .instrument(tracing::info_span!("kexec_shutdown_nvme"))
+                    .await;
+            }
+        };
+        let shutdown_pci = async {
+            pci_shutdown::shutdown_pci_devices()
+                .instrument(tracing::info_span!("kexec_shutdown_pci"))
+                .await
+        };
+        let (pci_result, (), ()) = (shutdown_pci, shutdown_mana, shutdown_nvme).join().await;
+        pci_result.context("failed to shut down PCI devices during kexec")?;
+
+        tracing::info!(CVM_ALLOWED, "blackout: devices shut down");
+
+        // Serialize state -> CPIO -> append to initrd
+        let state_bytes = mesh::payload::encode(saved_state);
+        let cpio = guest_kexec::build_cpio_archive(
+            guest_kexec::DEV_SERVICING_STATE_PATH,
+            &state_bytes,
+        );
+        let pad = (4 - (initrd.len() % 4)) % 4;
+        initrd.extend(std::iter::repeat(0u8).take(pad));
+        initrd.extend_from_slice(&cpio);
+
+        tracing::info!(
+            CVM_ALLOWED,
+            state_size = state_bytes.len(),
+            cpio_size = cpio.len(),
+            initrd_final_size = initrd.len(),
+            "blackout: state serialized into initrd"
+        );
+
+        // Build cmdline
+        let current_cmdline = std::fs::read_to_string("/proc/cmdline")
+            .context("failed to read /proc/cmdline")?;
+        let cmdline = guest_kexec::build_servicing_cmdline(&current_cmdline);
+
+        // Write to memfds and call kexec_file_load
+        let kernel_fd = guest_kexec::create_memfd_with_data("vmlinuz", &vmlinuz)?;
+        let initrd_fd = guest_kexec::create_memfd_with_data("initrd", &initrd)?;
+
+        tracing::info!(CVM_ALLOWED, "blackout: invoking kexec_file_load");
+
+        kexec_sys::kexec_file_load(
+            kernel_fd,
+            initrd_fd,
+            &cmdline,
+            kexec_sys::KEXEC_FILE_FORCE_DTB | kexec_sys::KEXEC_FILE_DEBUG,
+        )
+        .context("kexec_file_load failed")?;
+
+        tracing::info!(CVM_ALLOWED, "blackout: kexec loaded, triggering reboot");
+        kexec_sys::kexec_reboot().context("kexec reboot failed")?;
+
+        Ok(())
+    }
+
     async fn handle_servicing_request(
         &mut self,
         correlation_id: Guid,

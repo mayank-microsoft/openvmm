@@ -7,6 +7,9 @@
 //! IGVM, building a CPIO overlay with serialized device state, and invoking
 //! `kexec_file_load` to boot into the new kernel.
 
+
+#![allow(unsafe_code)]
+
 use anyhow::Context;
 
 /// Path in the initramfs where the serialized device state is stored.
@@ -128,7 +131,7 @@ pub fn is_servicing_boot(cmdline: &str) -> bool {
 }
 
 /// Create a memfd, write data to it, and return the raw fd.
-fn create_memfd_with_data(name: &str, data: &[u8]) -> anyhow::Result<i32> {
+pub fn create_memfd_with_data(name: &str, data: &[u8]) -> anyhow::Result<i32> {
     use std::ffi::CString;
     use std::io::Write;
     use std::os::fd::FromRawFd;

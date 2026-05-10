@@ -6,7 +6,7 @@
 
 #![cfg(target_os = "linux")]
 #![expect(missing_docs)]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod diag;
 mod dispatch;
