@@ -737,7 +737,7 @@ impl LoadedVm {
             kernel_fd,
             initrd_fd,
             &cmdline,
-            kexec_sys::KEXEC_FILE_FORCE_DTB | kexec_sys::KEXEC_FILE_DEBUG,
+            kexec_sys::KEXEC_FILE_DEBUG, // KEXEC_FILE_FORCE_DTB removed - may not be supported
         ) {
             Ok(()) => tracing::info!(CVM_ALLOWED, "kexec_file_load succeeded"),
             Err(ref e) => {
