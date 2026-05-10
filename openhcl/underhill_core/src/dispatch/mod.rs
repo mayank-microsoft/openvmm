@@ -521,7 +521,7 @@ impl LoadedVm {
                         Err(e) => {
                             tracing::error!(
                                 CVM_ALLOWED,
-                                error = %e,
+                                error = ?e,
                                 "guest-driven kexec servicing failed"
                             );
                             false
@@ -723,15 +723,28 @@ impl LoadedVm {
         let kernel_fd = guest_kexec::create_memfd_with_data("vmlinuz", &vmlinuz)?;
         let initrd_fd = guest_kexec::create_memfd_with_data("initrd", &initrd)?;
 
-        tracing::info!(CVM_ALLOWED, "blackout: invoking kexec_file_load");
+        tracing::info!(
+            CVM_ALLOWED,
+            kernel_fd,
+            initrd_fd,
+            cmdline_len = cmdline.len(),
+            vmlinuz_size = vmlinuz.len(),
+            initrd_size = initrd.len(),
+            "blackout: invoking kexec_file_load"
+        );
 
-        kexec_sys::kexec_file_load(
+        match kexec_sys::kexec_file_load(
             kernel_fd,
             initrd_fd,
             &cmdline,
             kexec_sys::KEXEC_FILE_FORCE_DTB | kexec_sys::KEXEC_FILE_DEBUG,
-        )
-        .context("kexec_file_load failed")?;
+        ) {
+            Ok(()) => tracing::info!(CVM_ALLOWED, "kexec_file_load succeeded"),
+            Err(ref e) => {
+                tracing::error!(CVM_ALLOWED, error = ?e, "kexec_file_load FAILED");
+                anyhow::bail!("kexec_file_load failed: {}", e);
+            }
+        }
 
         tracing::info!(CVM_ALLOWED, "blackout: kexec loaded, triggering reboot");
         kexec_sys::kexec_reboot().context("kexec reboot failed")?;
