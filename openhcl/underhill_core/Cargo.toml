@@ -168,6 +168,7 @@ futures.workspace = true
 getrandom.workspace = true
 jiff.workspace = true
 libc.workspace = true
+kexec_sys.workspace = true
 parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_helpers.workspace = true
