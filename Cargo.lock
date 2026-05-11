@@ -8328,6 +8328,7 @@ dependencies = [
  "firmware_pcat",
  "firmware_uefi",
  "firmware_uefi_custom_vars",
+ "flate2",
  "framebuffer",
  "fs-err",
  "futures",

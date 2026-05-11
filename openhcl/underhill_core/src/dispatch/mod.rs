@@ -702,7 +702,7 @@ impl LoadedVm {
             guest_kexec::DEV_SERVICING_STATE_PATH,
             &state_bytes,
         );
-        let pad = (4 - (initrd.len() % 4)) % 4;
+        let pad = (512 - (initrd.len() % 512)) % 512;
         initrd.extend(std::iter::repeat(0u8).take(pad));
         initrd.extend_from_slice(&cpio);
 
