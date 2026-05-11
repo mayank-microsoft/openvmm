@@ -378,7 +378,39 @@ impl Worker for UnderhillVmWorker {
             let (get_infra, get_watchdog_task) = construct_get().await?;
             let get_client = get_infra.get_client.clone();
 
-            let result = Self::new_or_restart(get_infra, params, true, None, driver).await;
+            // Check whether this boot was triggered by a guest-driven kexec
+            // servicing. If the kernel command line contains the servicing
+            // marker, read the saved state from the CPIO overlay file and
+            // follow the servicing restart path instead of the new-VM path.
+            let is_servicing_restart = std::fs::read_to_string("/proc/cmdline")
+                .map(|cmdline| {
+                    cmdline.contains(
+                        crate::guest_kexec::DEV_SERVICING_CMDLINE_MARKER,
+                    )
+                })
+                .unwrap_or(false);
+
+            let (boot_init, dev_servicing_state) = if is_servicing_restart {
+                let state_path = crate::guest_kexec::DEV_SERVICING_STATE_PATH;
+                let buf = std::fs::read(state_path)
+                    .context("guest-driven servicing: failed to read saved state from initramfs")?;
+                tracing::info!(
+                    CVM_ALLOWED,
+                    state_len = buf.len(),
+                    path = state_path,
+                    "guest-driven servicing: found saved state in initramfs"
+                );
+                let state: ServicingState = mesh::payload::decode(&buf)
+                    .context("guest-driven servicing: failed to decode saved state")?;
+                // Clean up so it does not persist across subsequent boots.
+                let _ = std::fs::remove_file(state_path);
+                (false, Some(state))
+            } else {
+                (true, None)
+            };
+
+            let result =
+                Self::new_or_restart(get_infra, params, boot_init, dev_servicing_state, driver).await;
 
             if let Err(err) = &result {
                 tracing::error!(
