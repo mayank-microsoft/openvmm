@@ -49,16 +49,21 @@ pub fn kexec_file_load(
     cmdline: &str,
     flags: u64,
 ) -> Result<(), KexecError> {
+    // The kernel expects cmdline to be null-terminated, with cmdline_len
+    // including the null terminator byte.
+    let mut cmdline_buf = cmdline.as_bytes().to_vec();
+    cmdline_buf.push(0); // null terminator
+
     // SAFETY: kexec_file_load is a Linux syscall that reads from the
-    // provided fds and cmdline pointer. The cmdline pointer and length
+    // provided fds and cmdline pointer. The cmdline_buf and its length
     // are valid for the duration of the syscall.
     let ret = unsafe {
         libc::syscall(
             libc::SYS_kexec_file_load,
             kernel_fd as libc::c_long,
             initrd_fd as libc::c_long,
-            cmdline.len() as libc::c_ulong,
-            cmdline.as_ptr() as libc::c_ulong,
+            cmdline_buf.len() as libc::c_ulong,
+            cmdline_buf.as_ptr() as libc::c_ulong,
             flags as libc::c_ulong,
         )
     };
