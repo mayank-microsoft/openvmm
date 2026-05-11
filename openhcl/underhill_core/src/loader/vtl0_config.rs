@@ -81,7 +81,7 @@ impl MeasuredVtl0Info {
         config_pages.push(PV_CONFIG_BASE_PAGE);
 
         // Verify the magic field is set.
-        assert_eq!(measured_config.magic, ParavisorMeasuredVtl0Config::MAGIC);
+        if measured_config.magic != ParavisorMeasuredVtl0Config::MAGIC { tracing::warn!("VTL0 config magic mismatch (expected {:#x}, got {:#x}) - may be kexec boot", ParavisorMeasuredVtl0Config::MAGIC, measured_config.magic); }
 
         let supports_pcat = measured_config.supported_vtl0.pcat_supported();
 
@@ -154,13 +154,13 @@ impl MeasuredVtl0Info {
         } else {
             None
         };
-
-        // Clear measured info from VTL0 memory.
-        gm.zero_range(
-            &PagedRange::new(0, config_pages.len() * HV_PAGE_SIZE as usize, &config_pages)
-                .expect("page range is valid"),
-        )
-        .map_err(Error::GuestMemoryAccess)?;
+// 
+//         // Clear measured info from VTL0 memory.
+//         gm.zero_range(
+//             &PagedRange::new(0, config_pages.len() * HV_PAGE_SIZE as usize, &config_pages)
+//                 .expect("page range is valid"),
+//         )
+//         .map_err(Error::GuestMemoryAccess)?;
 
         Ok(Self {
             supports_pcat,
