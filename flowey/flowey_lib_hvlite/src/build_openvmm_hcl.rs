@@ -84,6 +84,7 @@ impl FlowNode for Node {
     fn imports(ctx: &mut ImportCtx<'_>) {
         ctx.import::<crate::run_cargo_build::Node>();
         ctx.import::<crate::init_openvmm_magicpath_openhcl_sysroot::Node>();
+        ctx.import::<crate::build_kexec_stub::Node>();
         ctx.import::<flowey_lib_common::install_dist_pkg::Node>();
     }
 
@@ -151,6 +152,21 @@ impl FlowNode for Node {
 
             features.extend(max_trace_level.features());
 
+            // Embed the kexec_stub flat binary so guest-driven kexec
+            // servicing can boot an uncompressed vmlinux (x86_64 only).
+            let extra_env = if matches!(arch, CommonArch::X86_64) {
+                let stub_bin =
+                    ctx.reqv(|v| crate::build_kexec_stub::Request { kexec_stub_bin: v });
+                Some(stub_bin.map(ctx, |p| {
+                    BTreeMap::from([(
+                        "OPENVMM_KEXEC_STUB_BIN".to_string(),
+                        p.display().to_string(),
+                    )])
+                }))
+            } else {
+                None
+            };
+
             let output = ctx.reqv(|v| crate::run_cargo_build::Request {
                 crate_name: "openvmm_hcl".into(),
                 out_name: "openvmm_hcl".into(),
@@ -167,7 +183,7 @@ impl FlowNode for Node {
                 features: CargoFeatureSet::Specific(features),
                 target,
                 no_split_dbg_info,
-                extra_env: None,
+                extra_env,
                 pre_build_deps,
                 output: v,
             });

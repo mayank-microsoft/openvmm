@@ -3774,6 +3774,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kexec_stub"
+version = "0.0.0"
+dependencies = [
+ "minimal_rt",
+ "minimal_rt_build",
+]
+
+[[package]]
 name = "kexec_sys"
 version = "0.1.0"
 dependencies = [

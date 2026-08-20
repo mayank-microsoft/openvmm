@@ -15,6 +15,7 @@ mod get_tracing;
 mod guest_kexec;
 mod inspect_internal;
 mod inspect_proc;
+mod kexec_stub_embed;
 mod livedump;
 mod loader;
 

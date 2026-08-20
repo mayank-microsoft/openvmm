@@ -19,6 +19,7 @@ pub mod build_igvmfilegen;
 pub mod build_nextest_unit_tests;
 pub mod build_nextest_vmm_tests;
 pub mod build_ohcldiag_dev;
+pub mod build_kexec_stub;
 pub mod build_openhcl_boot;
 pub mod build_openhcl_igvm_from_recipe;
 pub mod build_openhcl_initrd;

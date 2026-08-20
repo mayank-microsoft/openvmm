@@ -719,30 +719,75 @@ impl LoadedVm {
             .context("failed to read /proc/cmdline")?;
         let cmdline = guest_kexec::build_servicing_cmdline(&current_cmdline);
 
-        // Write to memfds and call kexec_file_load
-        let kernel_fd = guest_kexec::create_memfd_with_data("vmlinuz", &vmlinuz)?;
-        let initrd_fd = guest_kexec::create_memfd_with_data("initrd", &initrd)?;
+        // Choose the kexec path based on the custom binary format:
+        //   * uncompressed vmlinux ELF -> wrap in a synthetic bzImage that
+        //     embeds the stub + vmlinux + initrd (the initrd must live in VTL2
+        //     memory), loaded with KEXEC_FILE_NO_INITRAMFS.
+        //   * bzImage                  -> load directly with a separate initrd.
+        let use_stub =
+            cfg!(target_arch = "x86_64") && guest_kexec::custom_binary_is_vmlinux(&vmlinuz);
 
-        tracing::info!(
-            CVM_ALLOWED,
-            kernel_fd,
-            initrd_fd,
-            cmdline_len = cmdline.len(),
-            vmlinuz_size = vmlinuz.len(),
-            initrd_size = initrd.len(),
-            "blackout: invoking kexec_file_load"
-        );
+        if use_stub {
+            let stub = crate::kexec_stub_embed::kexec_stub_bin().context(
+                "custom binary is a vmlinux ELF but this build did not embed the kexec stub",
+            )?;
 
-        match kexec_sys::kexec_file_load(
-            kernel_fd,
-            initrd_fd,
-            &cmdline,
-            kexec_sys::KEXEC_FILE_FORCE_DTB | kexec_sys::KEXEC_FILE_DEBUG,
-        ) {
-            Ok(()) => tracing::info!(CVM_ALLOWED, "kexec_file_load succeeded"),
-            Err(ref e) => {
-                tracing::error!(CVM_ALLOWED, error = ?e, "kexec_file_load FAILED");
-                anyhow::bail!("kexec_file_load failed: {}", e);
+            tracing::info!(
+                CVM_ALLOWED,
+                stub_size = stub.len(),
+                vmlinuz_size = vmlinuz.len(),
+                initrd_size = initrd.len(),
+                cmdline_len = cmdline.len(),
+                "blackout: vmlinux detected; building stub bzImage and invoking kexec_file_load"
+            );
+
+            let bzimage_fd = guest_kexec::build_stub_bzimage_memfd(stub, &vmlinuz, &initrd)
+                .context("failed to build stub bzImage for vmlinux kexec")?;
+
+            match kexec_sys::kexec_file_load(
+                bzimage_fd,
+                -1,
+                &cmdline,
+                kexec_sys::KEXEC_FILE_NO_INITRAMFS,
+            ) {
+                Ok(()) => tracing::info!(CVM_ALLOWED, "kexec_file_load (stub) succeeded"),
+                Err(ref e) => {
+                    tracing::error!(CVM_ALLOWED, error = ?e, "kexec_file_load (stub) FAILED");
+                    anyhow::bail!("kexec_file_load failed (stub path): {}", e);
+                }
+            }
+        } else {
+            tracing::debug!(
+                CVM_ALLOWED,
+                is_bzimage = guest_kexec::custom_binary_is_bzimage(&vmlinuz),
+                "blackout: using direct bzImage kexec path"
+            );
+
+            // Write to memfds and call kexec_file_load
+            let kernel_fd = guest_kexec::create_memfd_with_data("vmlinuz", &vmlinuz)?;
+            let initrd_fd = guest_kexec::create_memfd_with_data("initrd", &initrd)?;
+
+            tracing::info!(
+                CVM_ALLOWED,
+                kernel_fd,
+                initrd_fd,
+                cmdline_len = cmdline.len(),
+                vmlinuz_size = vmlinuz.len(),
+                initrd_size = initrd.len(),
+                "blackout: invoking kexec_file_load"
+            );
+
+            match kexec_sys::kexec_file_load(
+                kernel_fd,
+                initrd_fd,
+                &cmdline,
+                kexec_sys::KEXEC_FILE_FORCE_DTB | kexec_sys::KEXEC_FILE_DEBUG,
+            ) {
+                Ok(()) => tracing::info!(CVM_ALLOWED, "kexec_file_load succeeded"),
+                Err(ref e) => {
+                    tracing::error!(CVM_ALLOWED, error = ?e, "kexec_file_load FAILED");
+                    anyhow::bail!("kexec_file_load failed: {}", e);
+                }
             }
         }
 
