@@ -288,6 +288,7 @@ impl<'a> ChipsetBuilder<'a> {
     }
 
     /// Wrap up device construction, returning the completed chipset and devices
+    #[tracing::instrument(name = "chipset_build", target = "openvmm::perf", skip_all)]
     pub fn build(self) -> Result<(Arc<Chipset>, ChipsetDevices), FinalChipsetBuilderError> {
         let mut inner = self.inner.into_inner();
         let mut errs = None;

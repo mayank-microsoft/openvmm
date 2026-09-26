@@ -197,6 +197,7 @@ impl<'a> BaseChipsetBuilder<'a> {
     /// extended with additional devices, alongside a collection of
     /// [`BaseChipsetDeviceInterfaces`] that will need to be wired up by the
     /// caller.
+    #[tracing::instrument(name = "base_chipset_build", target = "openvmm::perf", skip_all)]
     pub async fn build(
         self,
         driver_source: &'a VmTaskDriverSource,

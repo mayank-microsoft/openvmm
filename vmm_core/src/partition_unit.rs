@@ -189,6 +189,7 @@ impl PartitionUnit {
     ///
     /// The caller is responsible for launching a thread for each VP and running
     /// the VP using the returned [`VpRunner`]s.
+    #[tracing::instrument(name = "partition_unit_build", target = "openvmm::perf", skip_all)]
     pub fn new(
         spawner: impl Spawn,
         builder: UnitBuilder<'_>,
@@ -278,6 +279,7 @@ impl PartitionUnit {
     /// If the VM has been run before and has not been reset since it last ran,
     /// the target VTL will be scrubbed first so that the partition state is
     /// clean.
+    #[tracing::instrument(name = "vp_set_initial_regs", target = "openvmm::perf", skip_all)]
     pub async fn set_initial_regs(
         &mut self,
         vtl: Vtl,
@@ -289,6 +291,7 @@ impl PartitionUnit {
             .unwrap()
     }
 
+    #[tracing::instrument(name = "vm_accept_initial_pages", target = "openvmm::perf", skip_all)]
     pub async fn accept_initial_pages(
         &mut self,
         initial_pages: Vec<InitialPageImport>,

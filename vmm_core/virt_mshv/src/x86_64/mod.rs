@@ -97,6 +97,12 @@ impl virt::Hypervisor for LinuxMshv {
         virt::PlatformInfo {}
     }
 
+    #[tracing::instrument(
+        name = "hypervisor_new_partition",
+        target = "openvmm::perf",
+        skip_all,
+        fields(backend = "mshv")
+    )]
     fn new_partition<'a>(
         &mut self,
         config: ProtoPartitionConfig<'a>,
@@ -141,8 +147,12 @@ impl virt::Hypervisor for LinuxMshv {
             .map_err(|e| ErrorInner::SetPartitionProperty(e.into()))?;
         }
 
-        vmfd.initialize()
-            .map_err(|e| ErrorInner::CreateVMInitFailed(e.into()))?;
+        {
+            let _span =
+                tracing::info_span!(target: "openvmm::perf", "mshv_initialize_partition").entered();
+            vmfd.initialize()
+                .map_err(|e| ErrorInner::CreateVMInitFailed(e.into()))?;
+        }
 
         if snp {
             let snp_policy = igvm_snp_config.as_ref().map_or_else(
@@ -409,6 +419,12 @@ impl ProtoPartition for MshvProtoPartition<'_> {
         self.max_physical_address_size()
     }
 
+    #[tracing::instrument(
+        name = "hypervisor_build_partition",
+        target = "openvmm::perf",
+        skip_all,
+        fields(backend = "mshv")
+    )]
     fn build(
         self,
         config: PartitionConfig<'_>,
@@ -755,6 +771,12 @@ impl virt::BindProcessor for MshvProcessorBinder {
         Self: 'a;
     type Error = Error;
 
+    #[tracing::instrument(
+        name = "hypervisor_bind_vp",
+        target = "openvmm::perf",
+        skip_all,
+        fields(backend = "mshv", vp_index = self.vpindex.index())
+    )]
     fn bind(&mut self) -> Result<Self::Processor<'_>, Self::Error> {
         let inner = &self.partition.vps[self.vpindex.index() as usize];
 

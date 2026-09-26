@@ -313,6 +313,11 @@ fn smbios_config_from_cli(
     })
 }
 
+#[tracing::instrument(
+    name = "vm_config_from_command_line",
+    target = "openvmm::perf",
+    skip_all
+)]
 async fn vm_config_from_command_line(
     spawner: impl Spawn,
     mesh: &VmmMesh,
@@ -2752,6 +2757,8 @@ async fn run_control_inner(
     mesh_slot: &mut Option<VmmMesh>,
     opt: Options,
 ) -> anyhow::Result<i32> {
+    use tracing::Instrument as _;
+
     let mesh = mesh_slot.as_ref().unwrap();
     let (mut vm_config, mut resources) = vm_config_from_command_line(driver, mesh, &opt).await?;
 
@@ -2894,9 +2901,17 @@ async fn run_control_inner(
         };
 
         let params = VmWorkerParameters {
-            hypervisor: match &opt.hypervisor {
-                Some(name) => openvmm_helpers::hypervisor::hypervisor_resource(name)?,
-                None => openvmm_helpers::hypervisor::choose_hypervisor()?,
+            hypervisor: {
+                let _span = tracing::info_span!(
+                    target: "openvmm::perf",
+                    "select_hypervisor",
+                    requested_backend = opt.hypervisor.as_deref().unwrap_or("auto")
+                )
+                .entered();
+                match &opt.hypervisor {
+                    Some(name) => openvmm_helpers::hypervisor::hypervisor_resource(name)?,
+                    None => openvmm_helpers::hypervisor::choose_hypervisor()?,
+                }
             },
             cfg: vm_config,
             saved_state,
@@ -2906,6 +2921,7 @@ async fn run_control_inner(
         };
         vm_host
             .launch_worker(VM_WORKER, params)
+            .instrument(tracing::info_span!(target: "openvmm::perf", "launch_vm_worker"))
             .await
             .context("failed to launch vm worker")?
     };
@@ -2915,7 +2931,10 @@ async fn run_control_inner(
     }
 
     if !opt.paused {
-        vm_rpc.call(VmRpc::Resume, ()).await?;
+        vm_rpc
+            .call(VmRpc::Resume, ())
+            .instrument(tracing::info_span!(target: "openvmm::perf", "resume_vm_rpc"))
+            .await?;
     }
 
     let paravisor_diag = Arc::new(diag_client::DiagClient::from_dialer(

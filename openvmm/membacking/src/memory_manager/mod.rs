@@ -417,6 +417,7 @@ impl GuestMemoryBuilder {
     /// Each [`RamBackingRequest`] produces one RAM backing. File-backed
     /// requests allocate a memfd (or reuse `existing_mappable` if set);
     /// private requests use anonymous pages.
+    #[tracing::instrument(name = "guest_memory_build", target = "openvmm::perf", skip_all)]
     pub async fn build(self, max_addr: u64) -> Result<GuestMemoryManager, MemoryBuildError> {
         let backing_requests = self.backing_requests;
 
@@ -801,6 +802,12 @@ impl GuestMemoryManager {
     ///
     /// TODO: currently, all VTLs will get the same mappings--no support for
     /// per-VTL memory protections is supported.
+    #[tracing::instrument(
+        name = "guest_memory_attach_partition",
+        target = "openvmm::perf",
+        skip_all,
+        fields(?vtl)
+    )]
     pub async fn attach_partition(
         &mut self,
         vtl: Vtl,

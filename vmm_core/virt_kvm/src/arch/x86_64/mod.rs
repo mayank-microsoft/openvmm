@@ -147,6 +147,12 @@ impl virt::Hypervisor for Kvm {
         true
     }
 
+    #[tracing::instrument(
+        name = "hypervisor_new_partition",
+        target = "openvmm::perf",
+        skip_all,
+        fields(backend = "kvm")
+    )]
     fn new_partition<'a>(
         &mut self,
         mut config: ProtoPartitionConfig<'a>,
@@ -405,15 +411,20 @@ impl virt::Hypervisor for Kvm {
             }
         };
 
-        let vm = match isolation {
-            virt::IsolationType::None => self.kvm.new_vm(kvm::VmType::Default)?,
-            virt::IsolationType::Snp => {
-                let vm = self.kvm.new_vm(kvm::VmType::Snp)?;
-                vm.enable_hypercall_exits(1 << kvm::KVM_HC_MAP_GPA_RANGE_UAPI)?;
-                vm
-            }
-            virt::IsolationType::Vbs | virt::IsolationType::Tdx | virt::IsolationType::Cca => {
-                unreachable!()
+        let vm = {
+            let _span =
+                tracing::info_span!(target: "openvmm::perf", "hypervisor_create_vm", backend = "kvm")
+                    .entered();
+            match isolation {
+                virt::IsolationType::None => self.kvm.new_vm(kvm::VmType::Default)?,
+                virt::IsolationType::Snp => {
+                    let vm = self.kvm.new_vm(kvm::VmType::Snp)?;
+                    vm.enable_hypercall_exits(1 << kvm::KVM_HC_MAP_GPA_RANGE_UAPI)?;
+                    vm
+                }
+                virt::IsolationType::Vbs | virt::IsolationType::Tdx | virt::IsolationType::Cca => {
+                    unreachable!()
+                }
             }
         };
         vm.enable_split_irqchip(virt::irqcon::IRQ_LINES as u32)?;
@@ -461,6 +472,12 @@ impl ProtoPartition for KvmProtoPartition<'_> {
         max_physical_address_size_from_cpuid(&|eax, ecx| self.cpuid.result(eax, ecx, &[0; 4]))
     }
 
+    #[tracing::instrument(
+        name = "hypervisor_build_partition",
+        target = "openvmm::perf",
+        skip_all,
+        fields(backend = "kvm")
+    )]
     fn build(
         mut self,
         config: PartitionConfig<'_>,
@@ -514,8 +531,11 @@ impl ProtoPartition for KvmProtoPartition<'_> {
         // every synic interrupt delivery and VP-set operation falls back to
         // an O(n) linear scan.  Per-VP initialization (CPUID, MSRs, synic)
         // is deferred to bind().
-        for vp_info in self.config.processor_topology.vps_arch() {
-            self.vm.add_vp(vp_info.apic_id)?;
+        {
+            let _span = tracing::info_span!(target: "openvmm::perf", "kvm_create_vps").entered();
+            for vp_info in self.config.processor_topology.vps_arch() {
+                self.vm.add_vp(vp_info.apic_id)?;
+            }
         }
 
         let mut gsi_routing = GsiRouting::new();
@@ -878,6 +898,12 @@ impl virt::BindProcessor for KvmProcessorBinder {
     type Processor<'a> = KvmProcessor<'a>;
     type Error = KvmError;
 
+    #[tracing::instrument(
+        name = "hypervisor_bind_vp",
+        target = "openvmm::perf",
+        skip_all,
+        fields(backend = "kvm", vp_index = self.vpindex.index())
+    )]
     fn bind(&mut self) -> Result<Self::Processor<'_>, Self::Error> {
         let inner = &self.partition.vps[self.vpindex.index() as usize];
         let vp_info = inner.vp_info;
@@ -1572,6 +1598,7 @@ impl<'p> Processor for KvmProcessor<'p> {
         stop: StopVp<'_>,
         dev: &impl CpuIo,
     ) -> Result<Infallible, VpHaltReason> {
+        let mut first_bsp_run = self.vpindex.is_bsp();
         loop {
             self.inner.needs_yield.maybe_yield().await;
             stop.check()?;
@@ -1624,6 +1651,15 @@ impl<'p> Processor for KvmProcessor<'p> {
                     self.runner.complete_exit()
                 } else {
                     // Run the VP.
+                    if first_bsp_run {
+                        let _span = tracing::info_span!(
+                            target: "openvmm::perf",
+                            "first_bsp_run",
+                            backend = "kvm"
+                        )
+                        .entered();
+                        first_bsp_run = false;
+                    }
                     self.runner.run()
                 };
 

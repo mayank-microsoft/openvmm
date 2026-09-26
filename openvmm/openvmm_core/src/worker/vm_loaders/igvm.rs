@@ -677,6 +677,7 @@ pub struct LoadIgvmParams<'a, T: ArchTopology> {
     pub chipset_mmio: ChipsetMmioRanges,
 }
 
+#[tracing::instrument(name = "load_igvm", target = "openvmm::perf", skip_all)]
 pub fn load_igvm(
     params: LoadIgvmParams<'_, vm_topology::processor::TargetTopology>,
 ) -> Result<InitialLoad<loader::importer::Register>, Error> {

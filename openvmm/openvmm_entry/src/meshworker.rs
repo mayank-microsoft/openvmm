@@ -49,11 +49,19 @@ impl VmmMesh {
         })
     }
 
+    #[tracing::instrument(
+        name = "worker_host_create",
+        target = "openvmm::perf",
+        skip_all,
+        fields(host = tracing::field::Empty)
+    )]
     pub async fn make_host(
         &self,
         name: impl Into<String>,
         log_file: Option<PathBuf>,
     ) -> anyhow::Result<WorkerHost> {
+        let name = name.into();
+        tracing::Span::current().record("host", name.as_str());
         let log_file: Option<std::fs::File> = if let Some(file) = &log_file {
             Some(
                 std::fs::File::create(file)

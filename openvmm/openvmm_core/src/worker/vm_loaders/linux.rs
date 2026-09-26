@@ -167,6 +167,7 @@ fn smbios_tables_from_config(
 }
 
 #[cfg_attr(not(guest_arch = "x86_64"), expect(dead_code))]
+#[tracing::instrument(name = "load_linux_x86", target = "openvmm::perf", skip_all)]
 pub fn load_linux_x86(
     cfg: &KernelConfig<'_>,
     gm: &GuestMemory,

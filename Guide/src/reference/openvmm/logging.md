@@ -47,6 +47,33 @@ the process must have write access to the tracefs `user_events_data` file;
 OpenTelemetry initialization fails if `user_events` is unavailable or not
 writable.
 
+### Boot performance spans
+
+With OpenTelemetry enabled, spans on the `openvmm::perf` target show VM
+configuration, worker-host creation, hypervisor selection, worker launch, and
+the resume RPC in the controller. The VM worker traces partition creation,
+guest memory build and attachment, base and final chipset construction,
+partition-unit setup, firmware loading, PCI resource assignment, initial VP
+registers, and resume. KVM and MSHV use the same span names for partition
+creation, build, and VP binding; each has a `backend` attribute, and binding
+spans include `vp_index`. Backend-specific spans show VM/VCPU creation and
+MSHV partition initialization. `first_bsp_run` marks the first attempt to
+run the boot VP, **not** guest OS readiness.
+
+MSHV also emits per-range memory mapping spans at its regular tracing target;
+KVM does not have matching per-range spans. Use
+`guest_memory_attach_partition` for a backend-neutral mapping duration.
+
+Use the same guest configuration with `--hypervisor kvm` and
+`--hypervisor mshv`, and collect `user_events` before launching OpenVMM to
+capture startup.
+The controller and VM worker normally run in separate processes; their spans
+do not automatically share an OpenTelemetry trace ID. Correlate them by the
+collection run and process, for example by setting a distinct
+`OTEL_RESOURCE_ATTRIBUTES="service.instance.id=boot-run-1"` for each launch.
+Performance spans are excluded from stderr logging even when
+`OPENVMM_LOG_SPANS=1`.
+
 ## Configuring OpenHCL Trace Logging
 
 OpenHCL also supports `EnvFilter`-style trace logging, configured via the

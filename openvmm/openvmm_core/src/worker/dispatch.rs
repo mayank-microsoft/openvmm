@@ -337,13 +337,20 @@ impl Worker for VmWorker {
     type State = RestartState;
     const ID: WorkerId<Self::Parameters> = VM_WORKER;
 
+    #[tracing::instrument(name = "vm_worker_initialize", target = "openvmm::perf", skip_all)]
     fn new(parameters: Self::Parameters) -> anyhow::Result<Self> {
+        use tracing::Instrument as _;
+
         let (device_thread, device_driver) = new_device_thread();
 
         let manifest = Manifest::from_config(parameters.cfg);
 
-        let hypervisor = block_on(ResourceResolver::new().resolve(parameters.hypervisor, ()))
-            .context("failed to resolve hypervisor backend")?;
+        let hypervisor = block_on(
+            ResourceResolver::new()
+                .resolve(parameters.hypervisor, ())
+                .instrument(tracing::info_span!(target: "openvmm::perf", "resolve_hypervisor")),
+        )
+        .context("failed to resolve hypervisor backend")?;
 
         let shared_memory = parameters
             .shared_memory
@@ -1011,6 +1018,7 @@ impl InitializedVm {
     /// This is the main monomorphization point — callers provide a concrete
     /// `virt::Hypervisor` implementation. Called from the blanket impl of
     /// [`HypervisorBackend`](crate::hypervisor_backend::HypervisorBackend).
+    #[tracing::instrument(name = "vm_create_partition", target = "openvmm::perf", skip_all)]
     pub(crate) async fn new_with_hypervisor<P, H>(
         driver_source: VmTaskDriverSource,
         hypervisor: &mut H,
@@ -1489,6 +1497,7 @@ impl InitializedVm {
     ///
     // FUTURE: move more of this logic into new() so that more can be done
     //         outside the VM-PHU/live migration blackout window.
+    #[tracing::instrument(name = "vm_load", target = "openvmm::perf", skip_all)]
     async fn load(
         self,
         saved_state: Option<SavedState>,
@@ -3046,9 +3055,10 @@ impl InitializedVm {
                 let partition = partition.clone();
                 let chipset = chipset.clone();
                 let (send, recv) = mesh::oneshot();
+                let bind_parent_span = tracing::Span::current();
                 thread::Builder::new()
                     .name(format!("vp-{}", vp_index))
-                    .spawn(move || match vp.bind() {
+                    .spawn(move || match bind_parent_span.in_scope(|| vp.bind()) {
                         Ok(mut vp) => {
                             send.send(Ok(()));
                             block_on_vp(
@@ -3164,6 +3174,7 @@ impl LoadedVmInner {
         })
     }
 
+    #[tracing::instrument(name = "vm_load_firmware", target = "openvmm::perf", skip_all)]
     async fn load_firmware(&mut self, vtl2_only: bool) -> anyhow::Result<()> {
         let cache_topology = if cfg!(guest_arch = "aarch64") {
             Some(
@@ -3605,6 +3616,7 @@ impl LoadedVm {
     /// starts state units with VPs held stopped, performs the assignment,
     /// then stops state units again. The caller is responsible for
     /// resuming normally afterward.
+    #[tracing::instrument(name = "vm_assign_pci_resources", target = "openvmm::perf", skip_all)]
     async fn assign_pci_resources(&mut self) -> anyhow::Result<()> {
         if self.inner.pcie_host_bridges.is_empty() {
             return Ok(());

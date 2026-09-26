@@ -74,6 +74,7 @@ pub struct LoadUefiParams<'a> {
 }
 
 /// Loads the UEFI firmware.
+#[tracing::instrument(name = "load_uefi", target = "openvmm::perf", skip_all)]
 pub fn load_uefi(params: &LoadUefiParams<'_>) -> Result<Vec<Register>, Error> {
     let LoadUefiParams {
         firmware,

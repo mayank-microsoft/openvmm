@@ -143,6 +143,11 @@ impl<'a> MshvProtoPartition<'a> {
     /// Performs the post-init partition setup common to both architectures:
     /// creates VPs, BSP, installs intercepts, sets up the signal handler,
     /// and checks for unsupported VTL2 configuration.
+    #[tracing::instrument(
+        name = "mshv_proto_partition_setup",
+        target = "openvmm::perf",
+        skip_all
+    )]
     fn new(config: ProtoPartitionConfig<'a>, vmfd: VmFd) -> Result<Self, Error> {
         if config.processor_topology.vp_count() > u8::MAX as u32 {
             return Err(ErrorInner::TooManyVps(config.processor_topology.vp_count()).into());
@@ -161,9 +166,11 @@ impl<'a> MshvProtoPartition<'a> {
             })
             .collect();
 
-        let bsp = vmfd
-            .create_vcpu(0)
-            .map_err(|e| ErrorInner::CreateVcpu(e.into()))?;
+        let bsp = {
+            let _span = tracing::info_span!(target: "openvmm::perf", "mshv_create_bsp").entered();
+            vmfd.create_vcpu(0)
+                .map_err(|e| ErrorInner::CreateVcpu(e.into()))?
+        };
 
         // Install intercepts required by both architectures.
         vmfd.install_intercept(mshv_install_intercept {
@@ -623,6 +630,7 @@ impl virt::Processor for MshvProcessor<'_> {
     ) -> Result<Infallible, VpHaltReason> {
         let vpinner = self.inner;
         let _cleaner = MshvVpInnerCleaner { vpinner };
+        let mut first_bsp_run = self.vpindex.is_bsp();
 
         assert!(vpinner.thread.write().replace(Pthread::current()).is_none());
 
@@ -665,6 +673,15 @@ impl virt::Processor for MshvProcessor<'_> {
                 }
             }
 
+            if first_bsp_run {
+                let _span = tracing::info_span!(
+                    target: "openvmm::perf",
+                    "first_bsp_run",
+                    backend = "mshv"
+                )
+                .entered();
+                first_bsp_run = false;
+            }
             match self.runner.run() {
                 Ok(exit) => {
                     self.handle_exit(&exit, dev).await?;
@@ -857,6 +874,12 @@ impl From<MshvError> for KernelError {
 }
 
 /// Creates a VM with retry on EINTR.
+#[tracing::instrument(
+    name = "hypervisor_create_vm",
+    target = "openvmm::perf",
+    skip_all,
+    fields(backend = "mshv")
+)]
 fn create_vm_with_retry(
     mshv: &Mshv,
     args: &mshv_bindings::mshv_create_partition_v2,
